@@ -56,8 +56,10 @@ EUPHORIA_HOST = "euphoria.finance"
 PROXY_PORT = 8787
 
 # Window of recent WS frames kept for diagnostics. Trades themselves
-# resolve via the pending_taps map, not this buffer.
-FRAME_BUFFER_SIZE = 200
+# resolve via the pending_taps map, not this buffer. Sized for a full tap
+# lifecycle in a busy session — 200 was too small to span sent→executed→settled
+# when manual UI taps interleave with bot taps.
+FRAME_BUFFER_SIZE = 1000
 
 # Dense price tape: every price tick observed on the WS, keyed by source-side ts.
 # Sized for ~10 min at 5 Hz; bot reads via /price_tape.
@@ -92,12 +94,14 @@ class ProxyState:
         self.current_tap: Optional[dict] = None
         # Last-seen tradeId per status for diagnostics (manual taps too).
         self.last_executed: Optional[dict] = None
-        self.frames: list[dict] = []
+        self.frames: deque = deque(maxlen=FRAME_BUFFER_SIZE)
+        # External feeds, attached at startup so settle-time tick snapshots can
+        # be enriched from inside the WS-frame handler.
+        self.binance_feed = None
+        self.coinbase_feed = None
 
     def push_frame(self, direction: str, payload: Any) -> None:
         self.frames.append({"dir": direction, "ts": time.time(), "msg": payload})
-        if len(self.frames) > FRAME_BUFFER_SIZE:
-            self.frames = self.frames[-FRAME_BUFFER_SIZE :]
 
 
 STATE = ProxyState()
@@ -190,14 +194,41 @@ def _handle_received(msg: Any) -> None:
             if new_balance is not None:
                 STATE.balance = new_balance
             # Persist every settled position to disk for audit + later analysis.
+            matched = bool(tap and trade_id == tap.get("trade_id"))
+            cell_x = cell_y = None
+            if matched:
+                tap_args = (tap or {}).get("tap_args") or {}
+                cell_x = tap_args.get("cellX")
+                cell_y = tap_args.get("cellY")
+            # Attach a dense tick snapshot so scripts/rescore_logs.py can
+            # re-decide touch with the segment-crossing resolver. 70s covers a
+            # 5s settlement window plus the typical 60s pre-bet lookback.
+            now_ms = int(time.time() * 1000)
+            window_ms = 70_000
+            eu_ticks = [(ts, p) for (ts, p) in STATE.price_tape
+                        if ts >= now_ms - window_ms]
+            cb_ticks = []
+            if STATE.coinbase_feed is not None:
+                cb_ticks = [(t.ts_ms, t.price)
+                             for t in STATE.coinbase_feed.window(window_ms)]
+            bn_ticks = []
+            if STATE.binance_feed is not None:
+                bn_ticks = [(t.ts_ms, t.price)
+                             for t in STATE.binance_feed.window(window_ms)]
             _append_settlement_log({
                 "ts": time.time(),
                 "tradeId": trade_id,
+                "matched_current_tap": matched,
+                "cellX": cell_x,
+                "cellY": cell_y,
                 "settled": settled,
                 "data": data,
+                "priceTicks": eu_ticks,
+                "coinbaseTicks": cb_ticks,
+                "binanceTicks": bn_ticks,
             })
             # If this settles the current tap, complete its settled_future.
-            if tap and trade_id == tap.get("trade_id"):
+            if matched:
                 _record_lifecycle("settled")
                 sfut = tap.get("settled_future")
                 if sfut is not None and not sfut.done():
@@ -518,8 +549,9 @@ async def http_state(_req: web.Request) -> web.Response:
 
 
 async def http_frames(_req: web.Request) -> web.Response:
-    # Last N frames for debugging. Trim large payloads.
-    return web.json_response(STATE.frames[-50:])
+    # Last N frames for debugging. Trim large payloads. deque doesn't slice,
+    # so materialize via list() first.
+    return web.json_response(list(STATE.frames)[-50:])
 
 
 _chart_cache = {"ts": 0.0, "value": None}
@@ -705,7 +737,7 @@ async def http_tap(req: web.Request) -> web.Response:
     """
     page: Page = req.app["page"]
     if STATE.current_tap is not None:
-        return web.json_response({"status": "busy"}, status=409)
+        return web.json_response({"status": "busy", "tradeId": None}, status=409)
 
     body = await req.json()
     cell_x = int(body["cellX"])
@@ -719,8 +751,8 @@ async def http_tap(req: web.Request) -> web.Response:
     # Make sure the chart is exposed at window.__chart before tapping.
     hook = await install_chart_hook(page)
     if not (isinstance(hook, dict) and hook.get("ok")):
-        return web.json_response({"status": "chart_hook_failed", "hook": hook},
-                                  status=422)
+        return web.json_response({"status": "chart_hook_failed",
+                                   "tradeId": None, "hook": hook}, status=422)
 
     fut: asyncio.Future = asyncio.get_event_loop().create_future()
     settled_fut: asyncio.Future = asyncio.get_event_loop().create_future()
@@ -748,6 +780,7 @@ async def http_tap(req: web.Request) -> web.Response:
         if (isinstance(js_result, dict) and not js_result.get("ok")
                 and js_result.get("reason") in hard_fail_reasons):
             return web.json_response({"status": "placeBet_hard_failed",
+                                       "tradeId": STATE.current_tap.get("trade_id"),
                                        "jsResult": js_result}, status=422)
 
         try:
@@ -755,6 +788,7 @@ async def http_tap(req: web.Request) -> web.Response:
         except asyncio.TimeoutError:
             return web.json_response({
                 "status": "executed_timeout",
+                "tradeId": STATE.current_tap.get("trade_id"),
                 "tap": _serialize_tap(STATE.current_tap),
                 "tapJsResult": js_result,
             }, status=504)
@@ -790,7 +824,8 @@ async def http_tap(req: web.Request) -> web.Response:
 def _serialize_tap(tap: Optional[dict]) -> Optional[dict]:
     if tap is None:
         return None
-    return {k: v for k, v in tap.items() if k != "future"}
+    # Future objects don't JSON-serialize; strip both.
+    return {k: v for k, v in tap.items() if k not in ("future", "settled_future")}
 
 
 # ---------------------------------------------------------------------------
@@ -807,6 +842,10 @@ async def main() -> None:
     binance.start()
     coinbase = CoinbaseFeed()
     coinbase.start()
+    # Expose feeds to the WS-frame handler so settle-time tick snapshots can
+    # enrich settlements.jsonl entries.
+    STATE.binance_feed = binance
+    STATE.coinbase_feed = coinbase
     print(f"[proxy] started Binance + Coinbase feeds")
 
     # Install chart hook and the WS-direct quotesFeed listener.
