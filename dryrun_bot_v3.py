@@ -157,6 +157,127 @@ class Calibrator:
         return best
 
 
+# Regime-aware calibration. Buckets by (p_pred, σ, |drift|) — hierarchical fallback
+# from 3D → (p,σ) → (p) → identity. Built to address the LATE-phase failure mode
+# observed in Run #3 (3h dry-run): when avg drift ≈ $0.41 and σ ≈ 0.15, model
+# over-predicted touch_prob by ~30pp. A 1D-only Calibrator can't see this because
+# the gap is conditional on σ and drift, not on p alone.
+SIGMA_BINS = [(0.0, 0.08), (0.08, 0.13), (0.13, 0.18), (0.18, 9.99)]
+DRIFT_BINS = [(0.0, 0.30), (0.30, 0.45), (0.45, 9.99)]
+
+
+def _which_bin(value: float, bins: list[tuple[float, float]]) -> int:
+    for i, (lo, hi) in enumerate(bins):
+        if lo <= value < hi:
+            return i
+    return len(bins) - 1
+
+
+@dataclass
+class Calibrator2:
+    """Regime-aware Calibrator. Records per (p, σ, |drift|) bucket; produces
+    an adjusted touch-prob using hierarchical fallback when a bucket is sparse.
+
+    Usage:
+      cal2.record(p_pred=0.45, sigma=0.15, drift=0.42, won=False)
+      p_adj = cal2.adjust(p_pred=0.45, sigma=0.15, drift=0.42)
+      # ev = mult * p_adj - 1
+    """
+    window: int = 200
+    min_n: int = 8  # below this in a bucket, fall back to coarser bucket
+    blend: float = 0.4  # weight on empirical actual_WR; 1 - blend stays at p_pred
+    # history rows: (p_pred, sigma, drift_abs, won)
+    history: deque = field(default_factory=lambda: deque(maxlen=200))
+
+    def __post_init__(self):
+        # default_factory hardcodes maxlen=200; resize to honor `window`
+        if self.history.maxlen != self.window:
+            self.history = deque(self.history, maxlen=self.window)
+
+    def record(self, p_pred: float, sigma: float,
+               drift: float, won: bool) -> None:
+        self.history.append((p_pred, sigma, abs(drift), 1 if won else 0))
+
+    def _empirical_wr(self, p_lo: float, p_hi: float,
+                      s_idx: int | None, d_idx: int | None) -> tuple[float, int]:
+        """Mean actual WR for the (optionally-coarsened) bucket. Returns (wr, n)."""
+        wins = 0
+        n = 0
+        for p, s, d, w in self.history:
+            if not (p_lo <= p < p_hi):
+                continue
+            if s_idx is not None and _which_bin(s, SIGMA_BINS) != s_idx:
+                continue
+            if d_idx is not None and _which_bin(d, DRIFT_BINS) != d_idx:
+                continue
+            wins += w
+            n += 1
+        if n == 0:
+            return 0.0, 0
+        return wins / n, n
+
+    def adjust(self, p_pred: float, sigma: float, drift: float) -> float:
+        """Return p_pred shrunk toward the empirical actual_WR for the best
+        bucket we have enough data for. Hierarchical fallback:
+          1. 3D (p, σ, |drift|) bucket  — needs n >= min_n
+          2. 2D (p, σ) bucket
+          3. 1D (p) bucket
+          4. identity (return p_pred unchanged)
+        Blend `blend` of empirical with `1 - blend` of model prediction.
+        """
+        # Locate the p_pred bin
+        p_lo, p_hi = 0.0, 1.01
+        for lo, hi in P_BINS:
+            if lo <= p_pred < hi:
+                p_lo, p_hi = lo, hi
+                break
+        s_idx = _which_bin(abs(sigma), SIGMA_BINS)
+        d_idx = _which_bin(abs(drift), DRIFT_BINS)
+
+        # 1) 3D
+        wr, n = self._empirical_wr(p_lo, p_hi, s_idx, d_idx)
+        if n >= self.min_n:
+            return self.blend * wr + (1 - self.blend) * p_pred
+        # 2) 2D (p, σ)
+        wr, n = self._empirical_wr(p_lo, p_hi, s_idx, None)
+        if n >= self.min_n:
+            return self.blend * wr + (1 - self.blend) * p_pred
+        # 3) 1D (p)
+        wr, n = self._empirical_wr(p_lo, p_hi, None, None)
+        if n >= self.min_n:
+            return self.blend * wr + (1 - self.blend) * p_pred
+        # 4) identity (cold start)
+        return p_pred
+
+    def gap_summary(self, top_k: int = 5) -> str:
+        """Compact dump: top-k 3D buckets by |gap|, useful for periodic logging."""
+        rows = []
+        for s_idx in range(len(SIGMA_BINS)):
+            for d_idx in range(len(DRIFT_BINS)):
+                for p_lo, p_hi in P_BINS:
+                    wr, n = self._empirical_wr(p_lo, p_hi, s_idx, d_idx)
+                    if n < self.min_n:
+                        continue
+                    # average p in this bucket — for gap reporting
+                    ps = [p for p, s, d, _ in self.history
+                          if p_lo <= p < p_hi
+                          and _which_bin(s, SIGMA_BINS) == s_idx
+                          and _which_bin(d, DRIFT_BINS) == d_idx]
+                    avg_p = sum(ps) / len(ps) if ps else (p_lo + p_hi) / 2
+                    rows.append((avg_p - wr, p_lo, p_hi, s_idx, d_idx, n, wr, avg_p))
+        rows.sort(key=lambda r: -abs(r[0]))
+        if not rows:
+            return "(no buckets above min_n)"
+        out = []
+        for gap, p_lo, p_hi, s_idx, d_idx, n, wr, avg_p in rows[:top_k]:
+            sl, sh = SIGMA_BINS[s_idx]
+            dl, dh = DRIFT_BINS[d_idx]
+            out.append(f"p[{p_lo:.2f}-{p_hi:.2f}) σ[{sl:.2f}-{sh:.2f}) "
+                       f"d[{dl:.2f}-{dh:.2f}) n={n} avg_p={avg_p:.2f} "
+                       f"actual_WR={wr:.2f} gap={gap:+.2f}")
+        return " | ".join(out)
+
+
 # ---------------------------------------------------------------------------
 # Strategy: Edge C — OOM cell in direction of (external - EU) drift
 # ---------------------------------------------------------------------------
@@ -272,6 +393,19 @@ def main():
     ap.add_argument("--ev-haircut", type=float, default=0.0,
                     help="Adverse-selection haircut: subtract this from ev before "
                          "threshold check (Cartea-Jaimungal style; default 0.0).")
+    ap.add_argument("--calibrator2", action="store_true",
+                    help="Use regime-aware Calibrator2: shrink p_pred toward "
+                         "historical actual_WR for the (p, σ, |drift|) bucket. "
+                         "Fixes the LATE-phase overconfidence observed when "
+                         "drift jumps and σ stays moderate.")
+    ap.add_argument("--cal2-window", type=int, default=200,
+                    help="Calibrator2 rolling history length (default 200).")
+    ap.add_argument("--cal2-blend", type=float, default=0.4,
+                    help="Calibrator2 blend weight on empirical actual_WR; "
+                         "1-blend stays at p_pred. Default 0.4.")
+    ap.add_argument("--cal2-min-n", type=int, default=8,
+                    help="Calibrator2 min samples per bucket before using it "
+                         "(falls back to coarser bucket otherwise). Default 8.")
     ap.add_argument("--roll-correction", action="store_true",
                     help="Apply Roll (1984) bid-ask bounce correction to realized σ.")
     ap.add_argument("--tag", type=str, default="",
@@ -319,6 +453,8 @@ def main():
     pending: list[PendingBet] = []
     cum_ev_predicted = 0.0
     calibrator = Calibrator()
+    cal2 = Calibrator2(window=args.cal2_window, min_n=args.cal2_min_n,
+                       blend=args.cal2_blend) if args.calibrator2 else None
     # Per-cell mult history for --min-quote-mult-change-pct filter.
     # Keyed by (cellX, cellY); each value is a deque of (ts_ms, mult) entries.
     cell_mult_history: dict[tuple[int, int], deque] = {}
@@ -376,6 +512,11 @@ def main():
                 if touched_cb: wins_cb += 1
                 else: losses_cb += 1
                 calibrator.record(b.p_pred, touched_eu)
+                if cal2 is not None:
+                    cal2.record(b.p_pred, b.sigma, b.drift_at_bet, touched_eu)
+                    if (wins_eu + losses_eu) % 30 == 0:
+                        print(f"{TAG}[bot] CAL2 top buckets: "
+                              f"{cal2.gap_summary(top_k=3)}", flush=True)
             pending = still_pending
 
             # ----- Read proxy state -----
@@ -548,7 +689,8 @@ def main():
                     a = cy * PRICE_INTERVAL; b = a + PRICE_INTERVAL
                     p = _touch(a, b, eff_ts, eff_tau)
                     if p < args.min_p or p > args.max_p: continue
-                    ev = m * p - 1
+                    p_eff = cal2.adjust(p, sigma, drift_cb) if cal2 is not None else p
+                    ev = m * p_eff - 1
                     scored += 1
                     if best_local is None or ev > best_local["ev"]:
                         best_local = {"cx": cx, "cy": cy, "mult": m, "p": p,
@@ -576,7 +718,8 @@ def main():
                 eff_ts = max(0.0, t_start)
                 eff_tau = TIME_INTERVAL if t_start >= 0 else TIME_INTERVAL + t_start
                 p = _touch(pick["a"], pick["b"], eff_ts, eff_tau)
-                ev = pick["mult"] * p - 1
+                p_eff = cal2.adjust(p, sigma, drift_cb) if cal2 is not None else p
+                ev = pick["mult"] * p_eff - 1
                 return {"cx": pick["cx"], "cy": pick["cy"], "mult": pick["mult"],
                         "p": p, "ev": ev, "strategy": label}
 
@@ -607,7 +750,8 @@ def main():
                         eff_tau = TIME_INTERVAL if t_start >= 0 else TIME_INTERVAL + t_start
                         if eff_tau <= 0: continue
                         p = _touch(a, b, eff_ts, eff_tau)
-                        ev = m * p - 1
+                        p_eff = cal2.adjust(p, sigma, drift_cb) if cal2 is not None else p
+                        ev = m * p_eff - 1
                         best_d = d
                         best_local = {"cx": cx, "cy": cy, "mult": m, "p": p,
                                       "ev": ev, "strategy": "b"}
