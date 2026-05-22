@@ -72,12 +72,13 @@ def load_settlements(path: str) -> list[dict]:
 
 
 def _settled_ticks(entry: dict) -> list[tuple[int, float]]:
-    """If a settlement entry has price ticks attached, return them sorted.
-    Most entries won't — they hold the post-trade `settled` field only. If
-    the proxy is later extended to attach the dense window ticks (P3),
-    this is where they'd be read from."""
-    data = entry.get("data") or {}
-    ticks = data.get("priceTicks") or []
+    """Return EU dense ticks sorted ascending. The signing-proxy P3 patch
+    attaches them at entry["priceTicks"]; older entries fall back to
+    entry["data"]["priceTicks"] (the placeholder shape used pre-patch)."""
+    ticks = entry.get("priceTicks")
+    if not ticks:
+        data = entry.get("data") or {}
+        ticks = data.get("priceTicks") or []
     out = []
     for t in ticks:
         try:
@@ -147,15 +148,17 @@ def main() -> int:
     entries = load_settlements(args.settlements)
     by_cell: dict[tuple[int, int], list[dict]] = {}
     for e in entries:
-        data = e.get("data") or {}
-        # The cell coords aren't directly in settled records as of this writing;
-        # we look them up under a few likely keys for forward-compat.
-        for key_path in (("cellX", "cellY"),):
-            cx = data.get(key_path[0])
-            cy = data.get(key_path[1])
-            if cx is not None and cy is not None:
-                by_cell.setdefault((int(cx), int(cy)), []).append(e)
-                break
+        # P3 schema: cellX/cellY live at the top level on bot-matched taps.
+        # Fall back to data.cellX/cellY for forward-compat with future schemas.
+        cx = e.get("cellX")
+        cy = e.get("cellY")
+        if cx is None or cy is None:
+            data = e.get("data") or {}
+            cx = data.get("cellX")
+            cy = data.get("cellY")
+        if cx is None or cy is None:
+            continue
+        by_cell.setdefault((int(cx), int(cy)), []).append(e)
 
     out_fh = sys.stdout if args.out == "-" else open(args.out, "w")
     counts = {"changed": 0, "same": 0, "no_ticks": 0, "no_match": 0}
