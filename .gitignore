@@ -1,0 +1,4 @@
+logs/
+*.md
+__pycache__/
+*.pyc
