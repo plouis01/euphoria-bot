@@ -25,6 +25,7 @@ import signal
 import statistics
 import sys
 import time
+import urllib.error
 import urllib.request
 from collections import deque
 from dataclasses import dataclass, field
@@ -47,13 +48,13 @@ def http_get(path: str):
         return json.loads(r.read())
 
 
-def http_post(path: str, body: dict):
+def http_post(path: str, body: dict, timeout: float = 15.0):
     req = urllib.request.Request(
         PROXY + path, method="POST",
         data=json.dumps(body).encode(),
         headers={"Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(req, timeout=15) as r:
+    with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read())
 
 
@@ -282,6 +283,82 @@ class Calibrator2:
 # Strategy: Edge C — OOM cell in direction of (external - EU) drift
 # ---------------------------------------------------------------------------
 
+class LiveLedger:
+    """LIVE-mode accounting source-of-truth. Polls the proxy's /settlements
+    endpoint (which writes a record per on-chain settled position) and updates
+    wins/losses/realized_pnl independently of the /tap response. Required
+    because /tap frequently returns 504/timeout even when the position
+    eventually settles — historic source of "bot blind to its own taps".
+
+    Idempotent on tradeId: each settlement counted once regardless of how
+    many times poll() sees it.
+    """
+
+    def __init__(self):
+        self.seen_trade_ids: set[str] = set()
+        self.wins = 0
+        self.losses = 0
+        self.realized_pnl = 0.0
+        self.last_balance: float | None = None
+
+    def prime(self, http_get_fn) -> None:
+        """At startup: record all pre-existing tradeIds as 'already seen' so
+        we don't count old positions from a previous session as this bot's."""
+        try:
+            resp = http_get_fn("/settlements?n=500")
+            for e in resp.get("entries", []):
+                tid = e.get("tradeId")
+                if tid:
+                    self.seen_trade_ids.add(tid)
+        except Exception as e:
+            print(f"[ledger] prime failed: {e}", flush=True)
+
+    def poll(self, http_get_fn, tag: str = "") -> list[dict]:
+        """Fetch new settlements; update counters; return list of new entries
+        (each entry as the proxy schema, useful for callers to log)."""
+        new_entries: list[dict] = []
+        try:
+            resp = http_get_fn("/settlements?n=200")
+            entries = resp.get("entries", []) or []
+        except Exception as e:
+            print(f"{tag}[ledger] poll failed: {e}", flush=True)
+            return new_entries
+        for e in entries:
+            tid = e.get("tradeId")
+            if not tid or tid in self.seen_trade_ids:
+                continue
+            # Only count entries the proxy matched to one of our /tap calls.
+            # `matched_current_tap=True` means the settle event arrived while
+            # STATE.current_tap was set; we treat these as ours.
+            if not e.get("matched_current_tap"):
+                self.seen_trade_ids.add(tid)  # mark seen but don't count
+                continue
+            data = (e.get("data") or {})
+            settled = data.get("settled") or {}
+            outcome = settled.get("outcome")  # "won" / "lost"
+            try:
+                pnl = float(settled.get("pnl", 0.0))
+            except (TypeError, ValueError):
+                pnl = 0.0
+            ub = settled.get("updatedBalance")
+            try:
+                self.last_balance = float(ub) if ub is not None else self.last_balance
+            except (TypeError, ValueError):
+                pass
+            if outcome == "won":
+                self.wins += 1
+            elif outcome == "lost":
+                self.losses += 1
+            else:
+                # No outcome field — ignore but still mark seen.
+                self.seen_trade_ids.add(tid)
+                continue
+            self.realized_pnl += pnl
+            self.seen_trade_ids.add(tid)
+            new_entries.append(e)
+        return new_entries
+
+
 def pick_edge_c_cell(cells, P_now, signal, t_idx_target,
                      min_mult, max_mult, mean_rev: bool = False):
     """Pick OOM cell at the given τ in the signal direction, nearest to target.
@@ -455,6 +532,18 @@ def main():
     calibrator = Calibrator()
     cal2 = Calibrator2(window=args.cal2_window, min_n=args.cal2_min_n,
                        blend=args.cal2_blend) if args.calibrator2 else None
+    # LIVE source-of-truth: poll /settlements for on-chain outcomes.
+    # /tap responses are unreliable (frequent 504s on successful settlements);
+    # the ledger reads the proxy's persistent settlement log and counts each
+    # tradeId at most once. wins_eu/losses_eu/realized_pnl reflect REAL on-chain
+    # outcomes, so max-loss gate works correctly.
+    ledger = LiveLedger() if args.live else None
+    if ledger is not None:
+        ledger.prime(http_get)
+        print(f"{TAG}[bot] LiveLedger primed with "
+              f"{len(ledger.seen_trade_ids)} pre-existing settlements", flush=True)
+    slippage_rejects = 0
+    live_attempts = 0  # /tap POSTs we made (success+error)
     # Per-cell mult history for --min-quote-mult-change-pct filter.
     # Keyed by (cellX, cellY); each value is a deque of (ts_ms, mult) entries.
     cell_mult_history: dict[tuple[int, int], deque] = {}
@@ -472,6 +561,42 @@ def main():
             if os.path.exists(KILL_FILE):
                 print(f"{TAG}[bot] kill file present, stopping", flush=True)
                 break
+
+            # ----- LIVE: poll on-chain settlements (source of truth) -----
+            if ledger is not None:
+                for e in ledger.poll(http_get, tag=TAG):
+                    data = (e.get("data") or {})
+                    settled = data.get("settled") or {}
+                    outcome = settled.get("outcome")
+                    pnl = settled.get("pnl")
+                    mult = settled.get("multiplier")
+                    tid = (e.get("tradeId") or "")[:14]
+                    print(f"{TAG}[bot] LIVE settled tradeId={tid} "
+                          f"cell=({e.get('cellX')},{e.get('cellY')}) "
+                          f"mult={mult} outcome={outcome} pnl=${pnl} "
+                          f"bal=${ledger.last_balance} "
+                          f"w/l={ledger.wins}/{ledger.losses} "
+                          f"realized=${ledger.realized_pnl:+.4f}", flush=True)
+                    # Drive Calibrator from real outcomes too (for LIVE-mode
+                    # calibration data).
+                    if outcome in ("won", "lost"):
+                        # We don't have the original p_pred for this settlement;
+                        # the proxy doesn't carry it. Skip cal training here.
+                        pass
+                # Bind for downstream use.
+                wins_eu = ledger.wins
+                losses_eu = ledger.losses
+                realized_pnl = ledger.realized_pnl
+                # Max-loss gate now sees REAL losses.
+                if -realized_pnl >= args.max_loss:
+                    print(f"{TAG}[bot] LIVE max-loss ${args.max_loss} hit "
+                          f"(realized=${realized_pnl:+.4f}), stopping",
+                          flush=True)
+                    break
+                if (wins_eu + losses_eu) >= args.max_taps:
+                    print(f"{TAG}[bot] LIVE max-taps {args.max_taps} hit "
+                          f"(w/l={wins_eu}/{losses_eu}), stopping", flush=True)
+                    break
 
             now_ms = int(time.time() * 1000)
             # ----- Resolve pending bets — EU dense tape + Coinbase tape -----
@@ -827,69 +952,101 @@ def main():
                 taps += 1
                 continue
 
-            # LIVE — new /tap blocks until settled (60s default timeout), so
-            # the response carries the full lifecycle outcome in one round-trip.
-            bal_before = cur_bal
+            # LIVE — fire-and-forget /tap. We do NOT trust the response for
+            # accounting (the LIVE proxy frequently returns 504 even when the
+            # position later settles successfully). Outcomes are picked up by
+            # the LiveLedger.poll() call at the top of the next loop iteration
+            # — that's the single source of truth for wins/losses/max-loss.
+            #
+            # This loop just classifies the /tap outcome for logging and
+            # records slippage rejections separately so the offline analysis
+            # can resolve "would-they-have-won" against the EU price tape.
+            live_attempts += 1
             try:
                 resp = http_post("/tap", {"cellX": cx, "cellY": cy,
                                           "amount": args.stake,
                                           "slippage": args.slippage,
                                           "waitSettled": True,
-                                          "timeoutS": 60})
-                print(f"{TAG}[bot] tap response: {json.dumps(resp)[:300]}", flush=True)
-            except Exception as e:
-                # Network error / 422 hard fail / 504 timeout — count as no-tap and continue.
-                # We do NOT increment `taps` because we can't confirm execution.
-                print(f"{TAG}[bot] /tap error: {e}", flush=True)
-                last_tap_ts = now
-                time.sleep(2.0)
-                continue
-            last_tap_ts = now
-            taps += 1
-
-            # Parse settled outcome from response.
-            settled = resp.get("settled") if isinstance(resp, dict) else None
-            new_bal = None
-            won = None
-            if isinstance(settled, dict):
-                settled_inner = settled.get("settled") or {}
-                new_bal_str = settled_inner.get("updatedBalance")
-                won = bool(settled_inner.get("won")) if "won" in settled_inner else None
-                if new_bal_str is not None:
-                    try: new_bal = float(new_bal_str)
-                    except (ValueError, TypeError): new_bal = None
-
-            # Fallback: read /chart for balance (more reliable than /state).
-            if new_bal is None:
+                                          "timeoutS": 60},
+                                 timeout=70.0)
+                print(f"{TAG}[bot] /tap accepted: "
+                      f"{json.dumps(resp)[:200] if isinstance(resp, dict) else str(resp)[:200]}",
+                      flush=True)
+            except urllib.error.HTTPError as he:
+                # Read body once — important: it's consumed on close.
                 try:
-                    ch = http_get("/chart")
-                    new_bal = float(ch["balance"]) if ch.get("balance") is not None else bal_before
+                    body = he.read().decode("utf-8", errors="replace")
                 except Exception:
-                    new_bal = bal_before
-
-            delta = new_bal - bal_before
-            # If we got an explicit `won` flag, use it; otherwise infer from delta.
-            if won is None:
-                won = delta > 0.001  # small epsilon to ignore floating noise
-            if won:
-                wins_eu += 1
-            else:
-                losses_eu += 1
-            # Track realized PnL locally for max-loss gate
-            realized_pnl = new_bal - starting_balance
-            print(f"{TAG}[bot] tap #{taps}: settled={resp.get('settledStatus','?') if isinstance(resp, dict) else '?'} "
-                  f"{'WIN' if won else 'LOSS'} delta=${delta:+.4f} "
-                  f"bal=${new_bal:.4f} cum=${realized_pnl:+.4f} "
-                  f"w/l={wins_eu}/{losses_eu}", flush=True)
-            # Max-loss gate (now actually works since balance is reliable)
-            if -realized_pnl >= args.max_loss:
-                print(f"{TAG}[bot] hit max-loss ${args.max_loss}, stopping", flush=True)
-                break
+                    body = ""
+                # SLIPPAGE_EXCEEDED → HTTP 409 with detail. Track separately;
+                # do NOT count as a settled tap (no money was moved).
+                if he.code == 409 and "SLIPPAGE" in body.upper():
+                    slippage_rejects += 1
+                    # Append a record for later "would they have won" analysis.
+                    try:
+                        os.makedirs("logs", exist_ok=True)
+                        with open("logs/slippage_rejects.jsonl", "a") as f:
+                            f.write(json.dumps({
+                                "ts": time.time(),
+                                "tag": args.tag,
+                                "cellX": cx, "cellY": cy,
+                                "mult_signed": mult,
+                                "p_pred": p, "ev_pred": ev,
+                                "sigma": sigma, "drift_cb": drift_cb,
+                                "stake": args.stake,
+                                "window_start_ms": cx * TIME_INTERVAL * 1000,
+                                "window_end_ms": cx * TIME_INTERVAL * 1000
+                                                 + TIME_INTERVAL * 1000,
+                                "body": body[:500],
+                            }) + "\n")
+                    except Exception as we:
+                        print(f"{TAG}[bot] slippage log write failed: {we}",
+                              flush=True)
+                    print(f"{TAG}[bot] /tap REJECTED slippage cell=({cx},{cy}) "
+                          f"signed_mult={mult} (total slip-rejects="
+                          f"{slippage_rejects}/{live_attempts})", flush=True)
+                elif he.code == 504:
+                    # Timeout — position is likely still settling. The ledger
+                    # poll will pick it up on a subsequent loop iteration.
+                    print(f"{TAG}[bot] /tap timeout cell=({cx},{cy}) "
+                          f"signed_mult={mult} — settlement pending, will be "
+                          f"picked up by ledger poll", flush=True)
+                elif he.code == 422:
+                    # Hard fail — placeBet rejected client-side before submit.
+                    print(f"{TAG}[bot] /tap hard-fail cell=({cx},{cy}) "
+                          f"signed_mult={mult} body={body[:200]}", flush=True)
+                else:
+                    print(f"{TAG}[bot] /tap HTTP {he.code} cell=({cx},{cy}) "
+                          f"body={body[:200]}", flush=True)
+            except Exception as e:
+                # Network error / generic timeout. The ledger poll handles
+                # late-arriving settlements.
+                print(f"{TAG}[bot] /tap error: {type(e).__name__}: {e} "
+                      f"cell=({cx},{cy}) signed_mult={mult} — ledger will "
+                      f"reconcile if settlement arrives", flush=True)
+            last_tap_ts = now
+            # NOTE: we do NOT increment wins_eu/losses_eu/taps here. Those are
+            # owned by LiveLedger via the poll at the top of the next loop
+            # iteration. This guarantees correct accounting even when /tap
+            # times out on successful settlements.
 
     finally:
         binance.stop(); coinbase.stop()
         if pending:
             print(f"{TAG}[bot] {len(pending)} pending bets unresolved", flush=True)
+        if ledger is not None:
+            # Final ledger poll to catch any settlements that arrived after the
+            # last cycle (e.g., during shutdown).
+            try:
+                ledger.poll(http_get, tag=TAG)
+            except Exception:
+                pass
+            wins_eu = ledger.wins
+            losses_eu = ledger.losses
+            print(f"\n{TAG}[bot] LIVE DONE  attempts={live_attempts} "
+                  f"slip_rejects={slippage_rejects} settled_w/l="
+                  f"{wins_eu}/{losses_eu} realized=${ledger.realized_pnl:+.4f}",
+                  flush=True)
         n = wins_eu + losses_eu
         print(f"\n{TAG}[bot] DONE  taps={taps} EU win/loss={wins_eu}/{losses_eu} "
               f"CB win/loss={wins_cb}/{losses_cb}", flush=True)
