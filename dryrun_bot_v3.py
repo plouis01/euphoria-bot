@@ -32,6 +32,7 @@ from dataclasses import dataclass, field
 # Use centralized proxy feeds (BinanceFeed/CoinbaseFeed both route through the
 # signing_proxy's /binance_tape and /coinbase_tape endpoints).
 from proxy_feed import BinanceFeed, CoinbaseFeed
+from resolver import touched_band
 from touch_prob import touch_prob, simulate_heston_paths, touch_prob_heston_from_paths
 
 
@@ -161,10 +162,16 @@ class Calibrator:
 # ---------------------------------------------------------------------------
 
 def pick_edge_c_cell(cells, P_now, signal, t_idx_target,
-                     min_mult, max_mult):
-    """Pick OOM cell at the given τ in the signal direction, nearest to target."""
-    direction = 1 if signal > 0 else -1
-    target = P_now + signal
+                     min_mult, max_mult, mean_rev: bool = False):
+    """Pick OOM cell at the given τ in the signal direction, nearest to target.
+
+    If mean_rev is True, bet AGAINST the drift direction — challenger
+    `c30s-meanrev` (Lane 4): tests whether c30s's edge is continuation
+    or counter-trend retrace.
+    """
+    eff_signal = -signal if mean_rev else signal
+    direction = 1 if eff_signal > 0 else -1
+    target = P_now + eff_signal
     best = None
     best_d = float("inf")
     for c in cells:
@@ -208,8 +215,14 @@ def main():
     ap.add_argument("--max-mult", type=float, default=1000.0)
     ap.add_argument("--min-p", type=float, default=0.0)
     ap.add_argument("--max-p", type=float, default=1.01)
-    ap.add_argument("--strategy", choices=["prob", "c90", "c30-strong", "b", "combo"],
+    ap.add_argument("--strategy", choices=["prob", "c90", "c30-strong",
+                                             "c30-strong-meanrev",
+                                             "c30-strong-quotedrop",
+                                             "b", "combo"],
                     default="prob")
+    ap.add_argument("--min-quote-age-ms", type=int, default=0,
+                    help="ONLY bet when quote age >= this (Lane-4 challenger "
+                         "c30s-quotedrop: MM is almost stale, under-reacts).")
     ap.add_argument("--c-thr", type=float, default=0.10,
                     help="|Coinbase - EU| ≥ this for Edge C90 to fire")
     ap.add_argument("--c-thr-strong", type=float, default=0.40,
@@ -342,8 +355,11 @@ def main():
                     eu_ticks = []
                 cb_ticks = [t for t in coinbase.window(180_000)
                             if b.window_start_ms <= t.ts_ms <= b.window_end_ms]
-                touched_eu = any(band_lo <= p < band_hi for _, p in eu_ticks)
-                touched_cb = any(band_lo <= t.price < band_hi for t in cb_ticks)
+                # Segment-crossing resolver: catches intra-tick band crossings
+                # that pure membership-of-sampled-ticks misses. See resolver.py.
+                touched_eu = touched_band(eu_ticks, band_lo, band_hi)
+                touched_cb = touched_band(
+                    [(t.ts_ms, t.price) for t in cb_ticks], band_lo, band_hi)
                 outcome_eu = "WIN" if touched_eu else "LOSS"
                 outcome_cb = "WIN" if touched_cb else "LOSS"
                 pnl_eu = (b.mult - 1) * b.stake if touched_eu else -b.stake
@@ -410,6 +426,12 @@ def main():
                 if int(now) % 5 == 0:
                     print(f"{TAG}[bot] quote stale ({q_age}ms > {args.max_quote_age_ms}ms)",
                           flush=True)
+                time.sleep(0.3); continue
+            # Lane-4 c30s-quotedrop: also require quote to be almost-stale.
+            if args.min_quote_age_ms > 0 and (q_age is None or q_age < args.min_quote_age_ms):
+                if int(now) % 5 == 0:
+                    print(f"{TAG}[bot] quote too fresh "
+                          f"({q_age}ms < min {args.min_quote_age_ms}ms)", flush=True)
                 time.sleep(0.3); continue
 
             # ----- Drift signal (Coinbase - EU; USD-clean, RedStone-aligned) -----
@@ -533,7 +555,7 @@ def main():
                                       "ev": ev, "strategy": "prob"}
                 return best_local
 
-            def score_edge_c(tau_sec, thr, label):
+            def score_edge_c(tau_sec, thr, label, mean_rev: bool = False):
                 nonlocal scored
                 if cb_price is None: return None
                 if abs(drift_cb) < thr: return None
@@ -544,7 +566,8 @@ def main():
                     cells_at_tau = sorted(
                         cells, key=lambda c: abs(c["cellX"] - target_cx))[:60]
                 pick = pick_edge_c_cell(cells_at_tau, P_now, drift_cb,
-                                        target_cx, args.min_mult, args.max_mult)
+                                        target_cx, args.min_mult, args.max_mult,
+                                        mean_rev=mean_rev)
                 if pick is None: return None
                 if not cell_mult_changed_enough(pick["cx"], pick["cy"]): return None
                 scored += 1
@@ -598,6 +621,14 @@ def main():
             elif args.strategy == "c30-strong":
                 best = score_edge_c(args.c_tau_strong_sec, args.c_thr_strong,
                                     "c30-strong")
+            elif args.strategy == "c30-strong-meanrev":
+                # Lane-4 challenger: same trigger, opposite direction.
+                best = score_edge_c(args.c_tau_strong_sec, args.c_thr_strong,
+                                    "c30-strong-meanrev", mean_rev=True)
+            elif args.strategy == "c30-strong-quotedrop":
+                # Lane-4 challenger: c30s + min-quote-age gate (handled above).
+                best = score_edge_c(args.c_tau_strong_sec, args.c_thr_strong,
+                                    "c30-strong-quotedrop")
             elif args.strategy == "b":
                 best = score_edge_b()
             elif args.strategy == "combo":
