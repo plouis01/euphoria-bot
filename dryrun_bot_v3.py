@@ -664,7 +664,7 @@ def main():
 
             cur_bal = float(st["balance"]) if st["balance"] else starting_balance
             realized_pnl = cur_bal - starting_balance
-            if -realized_pnl >= args.max_loss:
+            if not args.live and -realized_pnl >= args.max_loss:
                 print(f"{TAG}[bot] hit max-loss ${args.max_loss}", flush=True); break
             if taps >= args.max_taps:
                 print(f"{TAG}[bot] hit max-taps {args.max_taps}", flush=True); break
