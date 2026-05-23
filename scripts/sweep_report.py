@@ -33,24 +33,24 @@ SIGNAL_RE = re.compile(
     r"P_eu=\$(?P<p_eu>[\d.]+).*drift_cb=\$(?P<drift_cb>[+-][\d.]+)"
 )
 
-# Slippage haircut model — fit from LIVE settlement history (~80 bets).
-# In Run #2: slippage avg -8.3% (winners) / +X% (losers). Net signed PnL
-# differs from filled PnL.
-# Simplified model:
-#   - Rejection probability: f(signed_mult) = 1 - exp(-α·max(0, signed_mult-5))
-#     (high-mult cells get rejected more, low-mult almost never)
-#   - Conditional on accepted, slip_pct = -0.05 (5% average drag)
-SLIP_REJECT_ALPHA = 0.05  # gentler than v1 LIVE which had α≈0.10
-SLIP_AVG_DRAG = 0.06      # 6% mult drag on average
+# Slippage drag — modest haircut on winners' filled multiplier.
+# NOT calibrated from real LIVE rejection data (slippage_rejects_resolved.jsonl
+# is empty). Treat as a rough sanity ceiling on PnL, not ground truth.
+#
+# We DELIBERATELY no longer apply a rejection probability that discounts
+# losses, because:
+#   1. In dry-run accounting, every loss is a real -$1; pretending it might
+#      have been rejected makes losing high-mult configs look better.
+#   2. We don't have empirical rejection data to calibrate the discount.
+# If a real rejection-rate dataset becomes available, add it back as a
+# separate "EST_LIVE" column, not as the primary ranking metric.
+SLIP_AVG_DRAG = 0.06  # 6% mult drag on winning fills (LIVE Run #2 observation)
 def slip_adjusted_pnl(signed_mult: float, won: bool) -> float:
-    """Estimate live-mode PnL accounting for rejection + slip drag."""
-    reject_p = 1.0 - math.exp(-SLIP_REJECT_ALPHA * max(0.0, signed_mult - 5.0))
-    # If rejected, PnL = 0 (no money moved)
+    """Apply slippage drag to wins only. Losses cost a full $1."""
     if not won:
-        return -1.0 * (1.0 - reject_p)
-    # Win — net = (mult - 1) * (1 - drag) - rejection lottery weight
+        return -1.0
     filled_mult = signed_mult * (1.0 - SLIP_AVG_DRAG)
-    return (filled_mult - 1.0) * (1.0 - reject_p)
+    return filled_mult - 1.0
 
 
 def parse_tag_log(path: str) -> list[dict]:

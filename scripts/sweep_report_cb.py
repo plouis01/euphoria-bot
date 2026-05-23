@@ -27,14 +27,16 @@ SIGNAL_RE = re.compile(
     r"P_eu=\$(?P<p_eu>[\d.]+).*drift_cb=\$(?P<drift_cb>[+-][\d.]+)"
 )
 
-SLIP_REJECT_ALPHA = 0.05
-SLIP_AVG_DRAG = 0.06
+SLIP_AVG_DRAG = 0.06  # slippage drag on winning fills (uncalibrated)
 def slip_adjusted_pnl(signed_mult: float, won: bool) -> float:
-    reject_p = 1.0 - math.exp(-SLIP_REJECT_ALPHA * max(0.0, signed_mult - 5.0))
+    """Apply slippage drag to wins only. Losses cost a full $1.
+
+    Per reviewer: prior rejection-probability discount made losing high-mult
+    bets cost <$1, flipping money-losing configs positive. Reverted.
+    """
     if not won:
-        return -1.0 * (1.0 - reject_p)
-    filled_mult = signed_mult * (1.0 - SLIP_AVG_DRAG)
-    return (filled_mult - 1.0) * (1.0 - reject_p)
+        return -1.0
+    return signed_mult * (1.0 - SLIP_AVG_DRAG) - 1.0
 
 
 def parse_tag_log(path: str) -> list[dict]:

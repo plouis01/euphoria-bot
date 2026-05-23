@@ -994,7 +994,8 @@ def main():
                         heston_paths, a, b, eff_ts, eff_tau)
                 if args.drift_aware_touch:
                     return touch_prob_drift(P_now, a, b, sigma,
-                                            eff_ts, eff_tau, mu_eff)
+                                            eff_ts, eff_tau, mu_eff,
+                                            conv_sec=args.drift_conv_sec)
                 # Otherwise Gaussian (df=0) or Student-t (df>2) per --vol-df.
                 return touch_prob(P_now, a, b, sigma, eff_ts, eff_tau,
                                   df=args.vol_df)

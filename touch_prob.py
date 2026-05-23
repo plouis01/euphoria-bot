@@ -113,22 +113,36 @@ def _touch_in_window_drift(x: float, a: float, b: float, sigma: float,
 def touch_prob_drift(
     P0: float, a: float, b: float, sigma: float,
     t_start: float, tau: float, mu: float,
+    conv_sec: float = 2.0,
     n_quad: int = 41,
 ) -> float:
-    """Drift-aware version of touch_prob.
+    """Drift-aware version of touch_prob with finite drift convergence horizon.
 
-    P_t = P0 + μ·t + σ·W_t (arithmetic BM with drift μ in $/sec).
+    Model: drift μ ($/sec) applies linearly over the first `conv_sec` seconds,
+    then decays to zero. By time t_start (if t_start > conv_sec), the price
+    has been shifted by μ·conv_sec total; after that, evolution is zero-drift.
 
     For zero drift (μ=0) this reduces to the Gaussian formula in touch_prob().
+
+    The conv_sec parameter prevents drift from extrapolating over long
+    horizons (e.g., a 21-min wait would otherwise extrapolate $166 of drift
+    on a $2000 asset, putting all cells out of reach).
     """
     if a > b:
         a, b = b, a
     if sigma <= 0 or tau <= 0:
         return 1.0 if (a <= P0 < b) else 0.0
+
+    # Effective total drift shift by time t_start (capped at conv_sec).
+    drift_so_far = mu * min(t_start, conv_sec)
+    # Remaining drift inside the touch window [t_start, t_start+τ].
+    # If conv_sec is already past, in-window drift = 0; else, prorate.
+    remaining = max(0.0, conv_sec - t_start)
+    drift_in_window_rate = mu if remaining >= tau else (mu * remaining / tau)
+
     if t_start <= 0:
-        return _touch_in_window_drift(P0, a, b, sigma, tau, mu)
-    # Integrate over P(t_start) ~ N(P0 + μ·t_start, σ²·t_start)
-    mean_at_start = P0 + mu * t_start
+        return _touch_in_window_drift(P0, a, b, sigma, tau, drift_in_window_rate)
+    mean_at_start = P0 + drift_so_far
     sig_gap = sigma * sqrt(t_start)
     lo = mean_at_start - 6 * sig_gap
     hi = mean_at_start + 6 * sig_gap
@@ -138,7 +152,8 @@ def touch_prob_drift(
     for i in range(n_quad):
         x = lo + i * dx
         w = norm * exp(-((x - mean_at_start) ** 2) / (2 * sig_gap ** 2))
-        total += w * _touch_in_window_drift(x, a, b, sigma, tau, mu) * dx
+        total += w * _touch_in_window_drift(
+            x, a, b, sigma, tau, drift_in_window_rate) * dx
     return max(0.0, min(1.0, total))
 
 
