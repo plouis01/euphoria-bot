@@ -17,8 +17,10 @@ window(ms), realized_vol_per_sec(window_ms).
 """
 import asyncio
 import json
+import os
 import ssl
 import statistics
+import tempfile
 import threading
 import time
 import urllib.request
@@ -43,7 +45,6 @@ DEFAULT_RPC_URL = "https://mainnet.megaeth.com/rpc"
 # Without sharing, N bots ⇒ N× RPC pressure → rate limits.
 # With this cache, only the bot whose poll arrives first after TTL expires
 # does the real RPC; everyone else reads the file. N bots ⇒ ~1× RPC pressure.
-import tempfile
 CACHE_PATH = os.path.join(tempfile.gettempdir(), "redstone_eth_cache.json")
 CACHE_TTL_MS = 500  # serve cached values up to this age; matches RS's ~666ms publish cadence
 
@@ -134,7 +135,7 @@ class RedStoneChainFeed:
     """Polls RedStone Bolt ETH adapter on MegaETH ~3x/sec."""
 
     def __init__(self, rpc_url: str = DEFAULT_RPC_URL,
-                 poll_interval_ms: int = 2000,
+                 poll_interval_ms: int = 500,
                  maxlen: int = 20000):
         self.rpc_url = rpc_url
         self.poll_interval_ms = poll_interval_ms

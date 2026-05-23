@@ -289,6 +289,12 @@ WAVES: dict[str, list[dict]] = {
         {"tag": "RSUS_v9_drift",
          "args": ["--strategy", "c30-strong", "--signal-source", "coinbase",
                   "--calibrator2", "--drift-aware-touch", "--drift-conv-sec", "2.0"]},
+        # The actual LIVE Run #2 config (with --roll-correction). Different
+        # from RSUS_baseline_c30r which omits the roll flag.
+        {"tag": "RSUS_LIVE_c30r_vw30",
+         "args": ["--strategy", "c30-strong", "--c-thr-strong", "0.25",
+                  "--c-tau-strong-sec", "30", "--vol-window-sec", "30",
+                  "--signal-source", "coinbase", "--roll-correction"]},
     ],
 }
 
