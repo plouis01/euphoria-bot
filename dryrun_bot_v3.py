@@ -485,6 +485,19 @@ def main():
                          "(falls back to coarser bucket otherwise). Default 8.")
     ap.add_argument("--roll-correction", action="store_true",
                     help="Apply Roll (1984) bid-ask bounce correction to realized σ.")
+    # ---- F1: one-way-trend gate ----
+    ap.add_argument("--trend-gate-k", type=int, default=0,
+                    help="F1 filter: skip tap if last K signal-time drift_cb "
+                         "values are all strictly same-sign (nonzero). 0=off. "
+                         "Research recommends 5.")
+    # ---- F4: rolling-WR bandit ----
+    ap.add_argument("--bandit-window", type=int, default=0,
+                    help="F4 filter: rolling-WR bandit window over last K "
+                         "resolved outcomes. 0=off. Research recommends 6.")
+    ap.add_argument("--bandit-floor", type=float, default=0.15,
+                    help="F4 trips when rolling WR < this. Default 0.15.")
+    ap.add_argument("--bandit-pause-sec", type=float, default=300.0,
+                    help="F4 pause duration when triggered. Default 300s.")
     ap.add_argument("--tag", type=str, default="",
                     help="prefix for log lines (helps distinguish parallel runs)")
     args = ap.parse_args()
@@ -549,6 +562,21 @@ def main():
     cell_mult_history: dict[tuple[int, int], deque] = {}
     MULT_HISTORY_MAXLEN = 40  # ~5 min at 8s cadence
 
+    # ---- F1 + F4 regime filters ----
+    drift_streak: deque = deque(maxlen=args.trend_gate_k) \
+        if args.trend_gate_k > 0 else deque(maxlen=1)
+    outcome_history: deque = deque(maxlen=args.bandit_window) \
+        if args.bandit_window > 0 else deque(maxlen=1)
+    bandit_paused_until = 0.0
+    f1_skips = 0
+    f4_trips = 0
+    if args.trend_gate_k > 0:
+        print(f"{TAG}[bot] F1 trend-gate ARMED K={args.trend_gate_k}", flush=True)
+    if args.bandit_window > 0:
+        print(f"{TAG}[bot] F4 bandit ARMED window={args.bandit_window} "
+              f"floor={args.bandit_floor} pause={args.bandit_pause_sec}s",
+              flush=True)
+
     stop = {"flag": False}
     def on_sig(*_):
         stop["flag"] = True
@@ -583,6 +611,20 @@ def main():
                         # We don't have the original p_pred for this settlement;
                         # the proxy doesn't carry it. Skip cal training here.
                         pass
+                    # F4 bandit: feed resolved outcome into rolling-WR window.
+                    if args.bandit_window > 0 and outcome in ("won", "lost"):
+                        outcome_history.append(1 if outcome == "won" else 0)
+                        if len(outcome_history) == args.bandit_window:
+                            wr_recent = sum(outcome_history) / len(outcome_history)
+                            if wr_recent < args.bandit_floor and \
+                               time.time() >= bandit_paused_until:
+                                bandit_paused_until = time.time() + args.bandit_pause_sec
+                                f4_trips += 1
+                                print(f"{TAG}[bot] F4 BANDIT TRIGGERED "
+                                      f"wr={wr_recent:.2f} < {args.bandit_floor} "
+                                      f"over last {args.bandit_window}, "
+                                      f"pausing {args.bandit_pause_sec:.0f}s",
+                                      flush=True)
                 # Bind for downstream use.
                 wins_eu = ledger.wins
                 losses_eu = ledger.losses
@@ -597,6 +639,14 @@ def main():
                     print(f"{TAG}[bot] LIVE max-taps {args.max_taps} hit "
                           f"(w/l={wins_eu}/{losses_eu}), stopping", flush=True)
                     break
+
+            # F4 bandit pause gate: skip scoring entirely while paused.
+            if args.bandit_window > 0 and time.time() < bandit_paused_until:
+                if int(time.time()) % 15 == 0:
+                    print(f"{TAG}[bot] F4 paused, "
+                          f"{bandit_paused_until - time.time():.0f}s remaining",
+                          flush=True)
+                time.sleep(1.0); continue
 
             now_ms = int(time.time() * 1000)
             # ----- Resolve pending bets — EU dense tape + Coinbase tape -----
@@ -932,6 +982,24 @@ def main():
                   f"P_eu=${e_price:.2f} P_cb=${cb_price if cb_price else 'n/a'} "
                   f"drift_cb=${drift_cb:+.2f} q_age={q_age}ms (scored={scored})",
                   flush=True)
+
+            # F1 one-way-trend gate: record drift at signal time, then check
+            # whether the last K signals are all strictly same-sign. If so,
+            # abstain — Run #3 collapse pattern.
+            if args.trend_gate_k > 0:
+                drift_streak.append(drift_cb)
+                if len(drift_streak) == args.trend_gate_k:
+                    signs = [1 if d > 0 else (-1 if d < 0 else 0)
+                             for d in drift_streak]
+                    if 0 not in signs and len(set(signs)) == 1:
+                        f1_skips += 1
+                        print(f"{TAG}[bot] F1 SKIP trend-gate "
+                              f"K={args.trend_gate_k} all-{signs[0]:+d}-sign "
+                              f"drift_streak={[f'{d:+.2f}' for d in drift_streak]}",
+                              flush=True)
+                        last_tap_ts = now  # cadence rate-limit
+                        continue
+
             cum_ev_predicted += ev * args.stake
 
             if not args.live:
@@ -1045,7 +1113,8 @@ def main():
             losses_eu = ledger.losses
             print(f"\n{TAG}[bot] LIVE DONE  attempts={live_attempts} "
                   f"slip_rejects={slippage_rejects} settled_w/l="
-                  f"{wins_eu}/{losses_eu} realized=${ledger.realized_pnl:+.4f}",
+                  f"{wins_eu}/{losses_eu} realized=${ledger.realized_pnl:+.4f} "
+                  f"f1_skips={f1_skips} f4_trips={f4_trips}",
                   flush=True)
         n = wins_eu + losses_eu
         print(f"\n{TAG}[bot] DONE  taps={taps} EU win/loss={wins_eu}/{losses_eu} "
