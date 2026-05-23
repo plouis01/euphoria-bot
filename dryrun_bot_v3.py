@@ -516,6 +516,28 @@ def main():
     ap.add_argument("--state-stale-sec", type=float, default=600.0,
                     help="Drop persisted state entries older than this. "
                          "Default 600s.")
+    # ---- v8: regime switcher (HOT/COLD modes) ----
+    ap.add_argument("--regime-switch", action="store_true",
+                    help="v8: enable regime switcher. HOT mode = no σ filter; "
+                         "COLD mode = σ-ceiling=rs-cold-sigma-cap. "
+                         "Transitions driven by rolling WR + rolling σ.")
+    ap.add_argument("--rs-window", type=int, default=30,
+                    help="Rolling-WR window over last K resolved bets.")
+    ap.add_argument("--rs-sigma-window-sec", type=float, default=300.0,
+                    help="Rolling-σ averaging window (seconds of signals).")
+    ap.add_argument("--rs-hot-to-cold-wr", type=float, default=0.07,
+                    help="HOT→COLD trigger: rolling WR below this.")
+    ap.add_argument("--rs-hot-to-cold-sigma", type=float, default=0.18,
+                    help="HOT→COLD trigger: rolling avg σ above this.")
+    ap.add_argument("--rs-cold-to-hot-wr", type=float, default=0.10,
+                    help="COLD→HOT trigger: rolling WR above this (AND σ ok).")
+    ap.add_argument("--rs-cold-to-hot-sigma", type=float, default=0.15,
+                    help="COLD→HOT trigger: rolling avg σ below this (AND WR ok).")
+    ap.add_argument("--rs-cold-sigma-cap", type=float, default=0.12,
+                    help="σ ceiling enforced ONLY in COLD mode "
+                         "(W3_R1_strict best variant in HOUR_FINAL).")
+    ap.add_argument("--rs-start-mode", choices=["HOT", "COLD"], default="HOT",
+                    help="Starting mode (default HOT — unfiltered c30-strong).")
     ap.add_argument("--tag", type=str, default="",
                     help="prefix for log lines (helps distinguish parallel runs)")
     args = ap.parse_args()
@@ -591,6 +613,48 @@ def main():
     r1_skips = 0  # σ ceiling
     r3_skips = 0  # |drift| ceiling
 
+    # ---- v8 regime switcher ----
+    rs_mode = args.rs_start_mode  # "HOT" or "COLD"
+    rs_outcomes: deque = deque(maxlen=args.rs_window) if args.regime_switch else deque(maxlen=1)
+    rs_sigmas: deque = deque() if args.regime_switch else deque()  # (ts, sigma)
+    rs_transitions = 0
+    rs_cold_skips = 0  # bets skipped because in COLD with sigma > cap
+
+    def rs_avg_sigma_window() -> float:
+        cutoff = time.time() - args.rs_sigma_window_sec
+        while rs_sigmas and rs_sigmas[0][0] < cutoff:
+            rs_sigmas.popleft()
+        if not rs_sigmas:
+            return 0.0
+        return sum(s for _, s in rs_sigmas) / len(rs_sigmas)
+
+    def rs_eval_mode() -> None:
+        """Re-evaluate mode based on rolling WR + rolling σ. Mutates rs_mode."""
+        nonlocal rs_mode, rs_transitions
+        if not args.regime_switch:
+            return
+        if len(rs_outcomes) < args.rs_window:
+            return  # not enough data yet, stay in starting mode
+        wr = sum(rs_outcomes) / len(rs_outcomes)
+        avg_sigma = rs_avg_sigma_window()
+        if rs_mode == "HOT":
+            if wr < args.rs_hot_to_cold_wr or avg_sigma > args.rs_hot_to_cold_sigma:
+                rs_mode = "COLD"
+                rs_transitions += 1
+                print(f"{TAG}[bot] v8 REGIME HOT→COLD "
+                      f"wr_{args.rs_window}={wr:.2%} "
+                      f"avg_σ={avg_sigma:.3f} "
+                      f"(triggers wr<{args.rs_hot_to_cold_wr} or σ>{args.rs_hot_to_cold_sigma})",
+                      flush=True)
+        else:  # COLD
+            if wr > args.rs_cold_to_hot_wr and avg_sigma < args.rs_cold_to_hot_sigma:
+                rs_mode = "HOT"
+                rs_transitions += 1
+                print(f"{TAG}[bot] v8 REGIME COLD→HOT "
+                      f"wr_{args.rs_window}={wr:.2%} "
+                      f"avg_σ={avg_sigma:.3f}",
+                      flush=True)
+
     # Load persisted state (drift_streak ts-tagged tuples, outcome ts-tagged)
     if args.state_file and os.path.exists(args.state_file):
         try:
@@ -643,6 +707,13 @@ def main():
     if args.max_abs_drift < 99:
         print(f"{TAG}[bot] R3 |drift|-ceiling ARMED max_abs_drift=${args.max_abs_drift}",
               flush=True)
+    if args.regime_switch:
+        print(f"{TAG}[bot] v8 REGIME-SWITCH ARMED start={rs_mode} "
+              f"win={args.rs_window} "
+              f"H→C: wr<{args.rs_hot_to_cold_wr} or σ>{args.rs_hot_to_cold_sigma} | "
+              f"C→H: wr>{args.rs_cold_to_hot_wr} and σ<{args.rs_cold_to_hot_sigma} | "
+              f"cold σ-cap={args.rs_cold_sigma_cap}",
+              flush=True)
 
     stop = {"flag": False}
     def on_sig(*_):
@@ -678,6 +749,10 @@ def main():
                         # We don't have the original p_pred for this settlement;
                         # the proxy doesn't carry it. Skip cal training here.
                         pass
+                    # v8 regime switcher: feed LIVE outcome into rolling-WR.
+                    if args.regime_switch and outcome in ("won", "lost"):
+                        rs_outcomes.append(1 if outcome == "won" else 0)
+                        rs_eval_mode()
                     # F4 bandit: feed resolved outcome into rolling-WR window.
                     if args.bandit_window > 0 and outcome in ("won", "lost"):
                         outcome_history.append(1 if outcome == "won" else 0)
@@ -754,6 +829,9 @@ def main():
                 else: losses_eu += 1
                 if touched_cb: wins_cb += 1
                 else: losses_cb += 1
+                if args.regime_switch:
+                    rs_outcomes.append(1 if touched_eu else 0)
+                    rs_eval_mode()
                 calibrator.record(b.p_pred, touched_eu)
                 if cal2 is not None:
                     cal2.record(b.p_pred, b.sigma, b.drift_at_bet, touched_eu)
@@ -1048,8 +1126,21 @@ def main():
             print(f"{TAG}[bot] SIGNAL strat={best['strategy']} cell=({cx},{cy}) "
                   f"mult={mult} p={p:.3f} ev={ev:+.3f} σ={sigma:.3f} "
                   f"P_eu=${e_price:.2f} P_cb=${cb_price if cb_price else 'n/a'} "
-                  f"drift_cb=${drift_cb:+.2f} q_age={q_age}ms (scored={scored})",
+                  f"drift_cb=${drift_cb:+.2f} q_age={q_age}ms (scored={scored})"
+                  f"{' mode='+rs_mode if args.regime_switch else ''}",
                   flush=True)
+
+            # v8 regime switcher: record σ for the rolling-σ window, then
+            # apply σ-cap only if we're in COLD mode.
+            if args.regime_switch:
+                rs_sigmas.append((time.time(), sigma))
+                if rs_mode == "COLD" and sigma > args.rs_cold_sigma_cap:
+                    rs_cold_skips += 1
+                    if int(now) % 8 == 0:
+                        print(f"{TAG}[bot] v8 COLD-skip σ={sigma:.3f} > "
+                              f"{args.rs_cold_sigma_cap}", flush=True)
+                    last_tap_ts = now
+                    continue
 
             # R1 σ-ceiling: skip if vol regime is in kill zone.
             if sigma > args.max_sigma:
@@ -1203,7 +1294,9 @@ def main():
                   f"slip_rejects={slippage_rejects} settled_w/l="
                   f"{wins_eu}/{losses_eu} realized=${ledger.realized_pnl:+.4f} "
                   f"f1_skips={f1_skips} f4_trips={f4_trips} "
-                  f"r1_skips={r1_skips} r3_skips={r3_skips}",
+                  f"r1_skips={r1_skips} r3_skips={r3_skips} "
+                  f"rs_mode={rs_mode} rs_transitions={rs_transitions} "
+                  f"rs_cold_skips={rs_cold_skips}",
                   flush=True)
         n = wins_eu + losses_eu
         print(f"\n{TAG}[bot] DONE  taps={taps} EU win/loss={wins_eu}/{losses_eu} "
