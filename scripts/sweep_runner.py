@@ -24,6 +24,32 @@ COMMON = [
 ]
 
 WAVES: dict[str, list[dict]] = {
+    # TOP-tier bots: run for the full 11h, never killed by waves.
+    "top": [
+        {"tag": "TOP_v7_R1F4",
+         "args": ["--strategy", "c30-strong", "--c-thr-strong", "0.25",
+                  "--c-tau-strong-sec", "30", "--vol-window-sec", "30",
+                  "--max-sigma", "0.15", "--bandit-window", "6",
+                  "--bandit-floor", "0.15", "--bandit-pause-sec", "300",
+                  "--signal-source", "coinbase"]},
+        {"tag": "TOP_c30r_pure",
+         "args": ["--strategy", "c30-strong", "--c-thr-strong", "0.25",
+                  "--c-tau-strong-sec", "30", "--vol-window-sec", "30",
+                  "--signal-source", "coinbase"]},
+        {"tag": "TOP_c30s_orig",
+         "args": ["--strategy", "c30-strong", "--c-thr-strong", "0.40",
+                  "--c-tau-strong-sec", "30", "--vol-window-sec", "30",
+                  "--signal-source", "coinbase"]},
+        {"tag": "TOP_meanrev_R1",
+         "args": ["--strategy", "c30-strong-meanrev", "--c-thr-strong", "0.25",
+                  "--c-tau-strong-sec", "30", "--vol-window-sec", "30",
+                  "--max-sigma", "0.15", "--signal-source", "coinbase"]},
+        {"tag": "TOP_combo_all",
+         "args": ["--strategy", "combo", "--c-thr-strong", "0.25",
+                  "--c-tau-strong-sec", "30", "--vol-window-sec", "30",
+                  "--c-thr", "0.10", "--c-tau-sec", "90",
+                  "--signal-source", "coinbase", "--max-sigma", "0.15"]},
+    ],
     "wave1": [
         # Baseline current bot (no filters, no calibrator)
         {"tag": "W1_baseline_c30r",
@@ -191,7 +217,7 @@ if __name__ == "__main__":
         status()
     elif op == "kill_all":
         kill_all()
-    elif op.startswith("wave"):
+    elif op in WAVES:
         launch_wave(op)
     else:
         print(f"unknown op: {op}", file=sys.stderr); sys.exit(1)
