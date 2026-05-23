@@ -291,7 +291,7 @@ def main():
         print(f"#   {tag}: {n}")
     print("#", flush=True)
 
-    rpc = RpcClient(target_rate=2.0)
+    rpc = RpcClient(target_rate=3.0)
     block_cache: dict[int, tuple[int, int]] = {}
 
     # Output file
