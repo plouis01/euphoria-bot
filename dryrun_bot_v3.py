@@ -498,6 +498,24 @@ def main():
                     help="F4 trips when rolling WR < this. Default 0.15.")
     ap.add_argument("--bandit-pause-sec", type=float, default=300.0,
                     help="F4 pause duration when triggered. Default 300s.")
+    # ---- R1: σ ceiling (kill-zone filter, per evening analysis 2026-05-22) ----
+    ap.add_argument("--max-sigma", type=float, default=999.0,
+                    help="R1 filter: skip if σ_short > this. Per evening "
+                         "analysis, σ ≥ 0.15 had 5.6%% WR / -$14.60 across "
+                         "18 bets. 0.15 recommended.")
+    # ---- R3: |drift| ceiling (kill-zone filter) ----
+    ap.add_argument("--max-abs-drift", type=float, default=999.0,
+                    help="R3 filter: skip if |drift_cb| > this. Per analysis, "
+                         "|drift|>$0.50 had 0%% WR (n=7) excluding outlier. "
+                         "0.50 recommended.")
+    # ---- State persistence (survive bot restart without warmup-loss tax) ----
+    ap.add_argument("--state-file", type=str,
+                    default="logs/bot_filter_state.json",
+                    help="Persist F1 drift_streak + F4 outcome_history here. "
+                         "Loaded on startup if entries < --state-stale-sec.")
+    ap.add_argument("--state-stale-sec", type=float, default=600.0,
+                    help="Drop persisted state entries older than this. "
+                         "Default 600s.")
     ap.add_argument("--tag", type=str, default="",
                     help="prefix for log lines (helps distinguish parallel runs)")
     args = ap.parse_args()
@@ -570,11 +588,60 @@ def main():
     bandit_paused_until = 0.0
     f1_skips = 0
     f4_trips = 0
+    r1_skips = 0  # σ ceiling
+    r3_skips = 0  # |drift| ceiling
+
+    # Load persisted state (drift_streak ts-tagged tuples, outcome ts-tagged)
+    if args.state_file and os.path.exists(args.state_file):
+        try:
+            with open(args.state_file) as f:
+                st_persist = json.load(f)
+            cutoff = time.time() - args.state_stale_sec
+            if args.trend_gate_k > 0:
+                kept_drifts = [(t, d) for t, d in st_persist.get("drift_streak", [])
+                               if t >= cutoff]
+                # Keep only the most recent K entries
+                for _, d in kept_drifts[-args.trend_gate_k:]:
+                    drift_streak.append(d)
+                print(f"{TAG}[bot] F1 state loaded: "
+                      f"{len(drift_streak)} drifts from {args.state_file} "
+                      f"(filtered {len(st_persist.get('drift_streak', [])) - len(kept_drifts)} stale)",
+                      flush=True)
+            if args.bandit_window > 0:
+                kept_outc = [(t, o) for t, o in st_persist.get("outcomes", [])
+                             if t >= cutoff]
+                for _, o in kept_outc[-args.bandit_window:]:
+                    outcome_history.append(o)
+                print(f"{TAG}[bot] F4 state loaded: "
+                      f"{len(outcome_history)} outcomes "
+                      f"(filtered {len(st_persist.get('outcomes', [])) - len(kept_outc)} stale)",
+                      flush=True)
+        except Exception as e:
+            print(f"{TAG}[bot] state-file load failed: {e}", flush=True)
+
+    def save_filter_state() -> None:
+        if not args.state_file:
+            return
+        try:
+            with open(args.state_file, "w") as f:
+                json.dump({
+                    "drift_streak": [(time.time(), d) for d in drift_streak],
+                    "outcomes": [(time.time(), o) for o in outcome_history],
+                }, f)
+        except Exception:
+            pass  # non-critical
+
     if args.trend_gate_k > 0:
         print(f"{TAG}[bot] F1 trend-gate ARMED K={args.trend_gate_k}", flush=True)
     if args.bandit_window > 0:
         print(f"{TAG}[bot] F4 bandit ARMED window={args.bandit_window} "
               f"floor={args.bandit_floor} pause={args.bandit_pause_sec}s",
+              flush=True)
+    if args.max_sigma < 99:
+        print(f"{TAG}[bot] R1 σ-ceiling ARMED max_sigma={args.max_sigma}",
+              flush=True)
+    if args.max_abs_drift < 99:
+        print(f"{TAG}[bot] R3 |drift|-ceiling ARMED max_abs_drift=${args.max_abs_drift}",
               flush=True)
 
     stop = {"flag": False}
@@ -614,6 +681,7 @@ def main():
                     # F4 bandit: feed resolved outcome into rolling-WR window.
                     if args.bandit_window > 0 and outcome in ("won", "lost"):
                         outcome_history.append(1 if outcome == "won" else 0)
+                        save_filter_state()
                         if len(outcome_history) == args.bandit_window:
                             wr_recent = sum(outcome_history) / len(outcome_history)
                             if wr_recent < args.bandit_floor and \
@@ -983,11 +1051,31 @@ def main():
                   f"drift_cb=${drift_cb:+.2f} q_age={q_age}ms (scored={scored})",
                   flush=True)
 
+            # R1 σ-ceiling: skip if vol regime is in kill zone.
+            if sigma > args.max_sigma:
+                r1_skips += 1
+                if int(now) % 8 == 0:
+                    print(f"{TAG}[bot] R1 SKIP σ-ceiling σ={sigma:.3f} > "
+                          f"{args.max_sigma}", flush=True)
+                last_tap_ts = now
+                continue
+
+            # R3 |drift|-ceiling: skip if drift magnitude is in kill zone.
+            if abs(drift_cb) > args.max_abs_drift:
+                r3_skips += 1
+                if int(now) % 8 == 0:
+                    print(f"{TAG}[bot] R3 SKIP |drift|-ceiling "
+                          f"|drift|=${abs(drift_cb):.2f} > "
+                          f"${args.max_abs_drift}", flush=True)
+                last_tap_ts = now
+                continue
+
             # F1 one-way-trend gate: record drift at signal time, then check
             # whether the last K signals are all strictly same-sign. If so,
             # abstain — Run #3 collapse pattern.
             if args.trend_gate_k > 0:
                 drift_streak.append(drift_cb)
+                save_filter_state()
                 if len(drift_streak) == args.trend_gate_k:
                     signs = [1 if d > 0 else (-1 if d < 0 else 0)
                              for d in drift_streak]
@@ -1114,7 +1202,8 @@ def main():
             print(f"\n{TAG}[bot] LIVE DONE  attempts={live_attempts} "
                   f"slip_rejects={slippage_rejects} settled_w/l="
                   f"{wins_eu}/{losses_eu} realized=${ledger.realized_pnl:+.4f} "
-                  f"f1_skips={f1_skips} f4_trips={f4_trips}",
+                  f"f1_skips={f1_skips} f4_trips={f4_trips} "
+                  f"r1_skips={r1_skips} r3_skips={r3_skips}",
                   flush=True)
         n = wins_eu + losses_eu
         print(f"\n{TAG}[bot] DONE  taps={taps} EU win/loss={wins_eu}/{losses_eu} "
