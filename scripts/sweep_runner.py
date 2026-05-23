@@ -254,6 +254,42 @@ WAVES: dict[str, list[dict]] = {
          "args": ["--strategy", "c90", "--c-thr", "0.10", "--c-tau-sec", "90",
                   "--signal-source", "coinbase", "--calibrator2"]},
     ],
+
+    # ----- Sustainable RS wave: top 6 backtest configs + v9. Bot RedStone
+    # feed default is now 2000ms; 7 bots × 0.5 req/s = 3.5 req/s at RPC ceiling.
+    "rs_sus": [
+        {"tag": "RSUS_baseline_c30r",
+         "args": ["--strategy", "c30-strong", "--c-thr-strong", "0.25",
+                  "--c-tau-strong-sec", "30", "--vol-window-sec", "30",
+                  "--signal-source", "coinbase"]},
+        {"tag": "RSUS_R1_only",
+         "args": ["--strategy", "c30-strong", "--c-thr-strong", "0.25",
+                  "--c-tau-strong-sec", "30", "--vol-window-sec", "30",
+                  "--signal-source", "coinbase", "--max-sigma", "0.15"]},
+        {"tag": "RSUS_F4k4",
+         "args": ["--strategy", "c30-strong", "--c-thr-strong", "0.25",
+                  "--c-tau-strong-sec", "30", "--vol-window-sec", "30",
+                  "--signal-source", "coinbase", "--calibrator2",
+                  "--bandit-window", "4", "--bandit-floor", "0.15"]},
+        {"tag": "RSUS_R3_drift",
+         "args": ["--strategy", "c30-strong", "--c-thr-strong", "0.25",
+                  "--c-tau-strong-sec", "30", "--vol-window-sec", "30",
+                  "--signal-source", "coinbase",
+                  "--calibrator2", "--max-abs-drift", "0.50"]},
+        {"tag": "RSUS_studentt",
+         "args": ["--strategy", "c30-strong", "--c-thr-strong", "0.25",
+                  "--c-tau-strong-sec", "30", "--vol-window-sec", "30",
+                  "--signal-source", "coinbase",
+                  "--vol-model", "t", "--vol-df", "4.5"]},
+        {"tag": "RSUS_R1_strict",
+         "args": ["--strategy", "c30-strong", "--c-thr-strong", "0.25",
+                  "--c-tau-strong-sec", "30", "--vol-window-sec", "30",
+                  "--signal-source", "coinbase",
+                  "--calibrator2", "--max-sigma", "0.12"]},
+        {"tag": "RSUS_v9_drift",
+         "args": ["--strategy", "c30-strong", "--signal-source", "coinbase",
+                  "--calibrator2", "--drift-aware-touch", "--drift-conv-sec", "2.0"]},
+    ],
 }
 
 

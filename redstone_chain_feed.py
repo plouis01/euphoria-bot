@@ -94,7 +94,7 @@ class RedStoneChainFeed:
     """Polls RedStone Bolt ETH adapter on MegaETH ~3x/sec."""
 
     def __init__(self, rpc_url: str = DEFAULT_RPC_URL,
-                 poll_interval_ms: int = 300,
+                 poll_interval_ms: int = 2000,
                  maxlen: int = 20000):
         self.rpc_url = rpc_url
         self.poll_interval_ms = poll_interval_ms
