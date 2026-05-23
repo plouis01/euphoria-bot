@@ -78,9 +78,8 @@ class RsTick:
     price: float     # USD
 
 
-def _eth_call_latest(rpc_url: str, timeout: float = 0.8) -> tuple[int, int, int] | None:
-    """eth_call adapter.latestRoundData(). Returns (round_id, answer, started_at)
-    where answer is in 1e8 units, or None on error."""
+def _eth_call_uncached(rpc_url: str, timeout: float = 0.8) -> tuple[int, int, int] | None:
+    """Direct RPC call (no cache). Returns (round_id, answer, started_at_us)."""
     body = json.dumps({
         "jsonrpc": "2.0",
         "id": 1,
@@ -107,17 +106,28 @@ def _eth_call_latest(rpc_url: str, timeout: float = 0.8) -> tuple[int, int, int]
     if "result" not in payload:
         return None
     hex_data = payload["result"]
-    # Strip "0x", expect 5 uint256-equivalent words = 320 hex chars
     if not hex_data.startswith("0x") or len(hex_data) < 2 + 5 * 64:
         return None
     h = hex_data[2:]
     round_id = int(h[0:64], 16)
     answer_raw = int(h[64:128], 16)
-    # answer is int256 — handle two's-complement for negative (shouldn't happen for price)
     if answer_raw >= 1 << 255:
         answer_raw -= 1 << 256
     started_at = int(h[128:192], 16)
     return round_id, answer_raw, started_at
+
+
+def _eth_call_latest(rpc_url: str, timeout: float = 0.8) -> tuple[int, int, int] | None:
+    """Cached RPC call. Returns cached value if fresh; else fetches and updates cache."""
+    cached = _read_cache()
+    if cached:
+        age_ms = int(time.time() * 1000) - cached.get("fetched_ms", 0)
+        if 0 <= age_ms < CACHE_TTL_MS:
+            return cached["round_id"], cached["answer"], cached["started_at_us"]
+    result = _eth_call_uncached(rpc_url, timeout)
+    if result is not None:
+        _write_cache(*result)
+    return result
 
 
 class RedStoneChainFeed:
