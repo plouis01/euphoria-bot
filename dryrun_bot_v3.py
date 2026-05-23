@@ -36,6 +36,7 @@ from proxy_feed import BinanceFeed, CoinbaseFeed
 from resolver import touched_band
 from touch_prob import (touch_prob, simulate_heston_paths,
                         touch_prob_heston_from_paths, touch_prob_drift)
+from redstone_chain_feed import RedStoneChainFeed
 
 
 PROXY = os.environ.get("PROXY", "http://127.0.0.1:8787")
@@ -561,7 +562,12 @@ def main():
     binance.start()
     coinbase = CoinbaseFeed()
     coinbase.start()
-    print(f"{TAG}[bot] warming up Binance + Coinbase 5s...", flush=True)
+    # RedStone Bolt feed — same oracle Euphoria settles against. Used for
+    # RS=WIN/LOSS in resolve lines (alongside EU= and CB=). Non-fatal if
+    # offline (sweep_report_rs.py will just see RS=N/A).
+    redstone = RedStoneChainFeed()
+    redstone.start()
+    print(f"{TAG}[bot] warming up Binance + Coinbase + RedStone 5s...", flush=True)
     time.sleep(5)
     if not binance.connected:
         print(f"{TAG}[bot] FATAL: Binance WS not connected: {binance.last_error}", flush=True)
@@ -569,7 +575,10 @@ def main():
     if not coinbase.connected:
         print(f"{TAG}[bot] FATAL: Coinbase WS not connected: {coinbase.last_error}", flush=True)
         sys.exit(1)
-    print(f"{TAG}[bot] Binance msgs={binance.msg_count}  Coinbase msgs={coinbase.msg_count}",
+    rs_ok = redstone.connected
+    print(f"{TAG}[bot] Binance msgs={binance.msg_count}  "
+          f"Coinbase msgs={coinbase.msg_count}  "
+          f"RedStone msgs={redstone.msg_count} (connected={rs_ok})",
           flush=True)
 
     state0 = http_get("/state")
@@ -831,11 +840,23 @@ def main():
                     eu_ticks = []
                 cb_ticks = [t for t in coinbase.window(180_000)
                             if b.window_start_ms <= t.ts_ms <= b.window_end_ms]
+                # RedStone: query by startedAt range. This is the SAME oracle
+                # Euphoria settles on, so RS=WIN/LOSS is the ground truth for
+                # whether the bot would have won LIVE.
+                rs_ticks = redstone.window_at(b.window_start_ms, b.window_end_ms)
                 # Segment-crossing resolver: catches intra-tick band crossings
                 # that pure membership-of-sampled-ticks misses. See resolver.py.
                 touched_eu = touched_band(eu_ticks, band_lo, band_hi)
                 touched_cb = touched_band(
                     [(t.ts_ms, t.price) for t in cb_ticks], band_lo, band_hi)
+                if rs_ticks:
+                    touched_rs = touched_band(
+                        [(t.started_at_ms, t.price) for t in rs_ticks],
+                        band_lo, band_hi)
+                    outcome_rs = "WIN" if touched_rs else "LOSS"
+                else:
+                    touched_rs = None
+                    outcome_rs = "N/A"
                 outcome_eu = "WIN" if touched_eu else "LOSS"
                 outcome_cb = "WIN" if touched_cb else "LOSS"
                 pnl_eu = (b.mult - 1) * b.stake if touched_eu else -b.stake
@@ -843,7 +864,8 @@ def main():
                 print(f"{TAG}[bot] resolve cell=({b.cellX},{b.cellY}) "
                       f"band=[{band_lo:.2f},{band_hi:.2f}) "
                       f"strat={b.strategy} eu_n={len(eu_ticks)} cb_n={len(cb_ticks)} "
-                      f"EU={outcome_eu} CB={outcome_cb} "
+                      f"rs_n={len(rs_ticks)} "
+                      f"EU={outcome_eu} CB={outcome_cb} RS={outcome_rs} "
                       f"p_pred={b.p_pred:.3f} ev_pred={b.ev_pred:+.3f} "
                       f"σ_at_bet={b.sigma:.3f} drift_at_bet=${b.drift_at_bet:+.2f} "
                       f"pnl=${pnl_eu:+.4f}{disagree}", flush=True)
