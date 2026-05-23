@@ -38,6 +38,36 @@ LATEST_ROUND_DATA_SELECTOR = "0xfeaf968c"
 ADAPTER_ADDRESS = "0xc555c100DB24dF36D406243642C169CC5A937f09"
 DEFAULT_RPC_URL = "https://mainnet.megaeth.com/rpc"
 
+# ---- Shared cross-process cache (file-based) ----
+# Multiple bots running concurrently all query the same adapter every ~666ms.
+# Without sharing, N bots ⇒ N× RPC pressure → rate limits.
+# With this cache, only the bot whose poll arrives first after TTL expires
+# does the real RPC; everyone else reads the file. N bots ⇒ ~1× RPC pressure.
+import tempfile
+CACHE_PATH = os.path.join(tempfile.gettempdir(), "redstone_eth_cache.json")
+CACHE_TTL_MS = 500  # serve cached values up to this age; matches RS's ~666ms publish cadence
+
+def _read_cache() -> dict | None:
+    try:
+        with open(CACHE_PATH) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, ValueError):
+        return None
+
+def _write_cache(round_id: int, answer: int, started_at_us: int) -> None:
+    tmp = CACHE_PATH + f".tmp.{os.getpid()}"
+    try:
+        with open(tmp, "w") as f:
+            json.dump({
+                "fetched_ms": int(time.time() * 1000),
+                "round_id": round_id,
+                "answer": answer,
+                "started_at_us": started_at_us,
+            }, f)
+        os.replace(tmp, CACHE_PATH)  # atomic on POSIX
+    except OSError:
+        pass  # cache write failure is non-fatal
+
 
 @dataclass
 class RsTick:
