@@ -34,7 +34,8 @@ from dataclasses import dataclass, field
 # signing_proxy's /binance_tape and /coinbase_tape endpoints).
 from proxy_feed import BinanceFeed, CoinbaseFeed
 from resolver import touched_band
-from touch_prob import touch_prob, simulate_heston_paths, touch_prob_heston_from_paths
+from touch_prob import (touch_prob, simulate_heston_paths,
+                        touch_prob_heston_from_paths, touch_prob_drift)
 
 
 PROXY = os.environ.get("PROXY", "http://127.0.0.1:8787")
@@ -519,6 +520,15 @@ def main():
     ap.add_argument("--state-stale-sec", type=float, default=600.0,
                     help="Drop persisted state entries older than this. "
                          "Default 600s.")
+    # ---- v9: drift-aware touch-probability model ----
+    ap.add_argument("--drift-aware-touch", action="store_true",
+                    help="v9: use touch_prob_drift() with μ = drift_cb / "
+                         "drift-conv-sec. Down-scores wrong-direction cells.")
+    ap.add_argument("--drift-conv-sec", type=float, default=2.0,
+                    help="Seconds over which drift_cb converges to zero. "
+                         "Higher = weaker drift signal. Default 2.0.")
+    ap.add_argument("--max-drift-mu", type=float, default=0.5,
+                    help="Safety clamp on |μ| in $/sec. Default 0.5.")
     # ---- v8: regime switcher (HOT/COLD modes) ----
     ap.add_argument("--regime-switch", action="store_true",
                     help="v8: enable regime switcher. HOT mode = no σ filter; "
@@ -709,6 +719,10 @@ def main():
               flush=True)
     if args.max_abs_drift < 99:
         print(f"{TAG}[bot] R3 |drift|-ceiling ARMED max_abs_drift=${args.max_abs_drift}",
+              flush=True)
+    if args.drift_aware_touch:
+        print(f"{TAG}[bot] v9 DRIFT-AWARE TOUCH ARMED "
+              f"conv_sec={args.drift_conv_sec} max_|μ|=${args.max_drift_mu}/s",
               flush=True)
     if args.regime_switch:
         print(f"{TAG}[bot] v8 REGIME-SWITCH ARMED start={rs_mode} "
@@ -965,11 +979,22 @@ def main():
             now_s = time.time()
             cells = mults["cells"]
 
+            # v9: compute drift μ from drift_cb if enabled.
+            if args.drift_aware_touch and args.drift_conv_sec > 0:
+                mu_raw = drift_cb / args.drift_conv_sec  # $/sec
+                mu_eff = max(-args.max_drift_mu,
+                             min(args.max_drift_mu, mu_raw))
+            else:
+                mu_eff = 0.0
+
             def _touch(a: float, b: float, eff_ts: float, eff_tau: float) -> float:
                 """Dispatch to the configured touch-prob model."""
                 if heston_paths is not None:
                     return touch_prob_heston_from_paths(
                         heston_paths, a, b, eff_ts, eff_tau)
+                if args.drift_aware_touch:
+                    return touch_prob_drift(P_now, a, b, sigma,
+                                            eff_ts, eff_tau, mu_eff)
                 # Otherwise Gaussian (df=0) or Student-t (df>2) per --vol-df.
                 return touch_prob(P_now, a, b, sigma, eff_ts, eff_tau,
                                   df=args.vol_df)
@@ -1137,7 +1162,8 @@ def main():
                   f"mult={mult} p={p:.3f} ev={ev:+.3f} σ={sigma:.3f} "
                   f"P_eu=${e_price:.2f} P_cb=${cb_price if cb_price else 'n/a'} "
                   f"drift_cb=${drift_cb:+.2f} q_age={q_age}ms (scored={scored})"
-                  f"{' mode='+rs_mode if args.regime_switch else ''}",
+                  f"{' mode='+rs_mode if args.regime_switch else ''}"
+                  f"{' μ=$%+.3f/s' % mu_eff if args.drift_aware_touch else ''}",
                   flush=True)
 
             # v8 regime switcher: record σ for the rolling-σ window, then

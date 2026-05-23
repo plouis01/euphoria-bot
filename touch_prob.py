@@ -75,6 +75,73 @@ def _touch_in_window(x: float, a: float, b: float, sigma: float, tau: float,
     return min(1.0, 2.0 * (1.0 - _phi((x - b) / sd)))
 
 
+def _touch_in_window_drift(x: float, a: float, b: float, sigma: float,
+                           tau: float, mu: float) -> float:
+    """P[path visits [a,b] during [0, τ] | starts at x, drift μ ($/sec)].
+
+    Uses single-barrier reflection with drift (Reiner-Rubinstein, 1991).
+    For the band case with x outside [a,b], we use the closer barrier alone —
+    exact double-barrier-touch involves an infinite series; for 5-sec windows
+    with narrow bands the closer-side dominates.
+    """
+    if a <= x < b:
+        return 1.0
+    sd = sigma * sqrt(tau)
+    if sd <= 0:
+        return 0.0
+    sigma_sq = sigma * sigma
+    if x < a:
+        # Hit barrier 'a' from below. H = a - x > 0.
+        # P(τ_H ≤ τ) = Φ((μτ - H)/sd) + exp(2μH/σ²) · Φ(-(μτ + H)/sd)
+        H = a - x
+        arg = 2.0 * mu * H / sigma_sq
+        if arg > 50.0:  # drift overwhelms — almost certain
+            return 1.0
+        t1 = _phi((mu * tau - H) / sd)
+        t2 = exp(arg) * _phi(-(mu * tau + H) / sd) if arg > -50.0 else 0.0
+        return max(0.0, min(1.0, t1 + t2))
+    # x >= b: hit barrier 'b' from above. By symmetry flip drift sign.
+    H = x - b
+    arg = -2.0 * mu * H / sigma_sq
+    if arg > 50.0:
+        return 1.0
+    t1 = _phi((-mu * tau - H) / sd)
+    t2 = exp(arg) * _phi((mu * tau - H) / sd) if arg > -50.0 else 0.0
+    return max(0.0, min(1.0, t1 + t2))
+
+
+def touch_prob_drift(
+    P0: float, a: float, b: float, sigma: float,
+    t_start: float, tau: float, mu: float,
+    n_quad: int = 41,
+) -> float:
+    """Drift-aware version of touch_prob.
+
+    P_t = P0 + μ·t + σ·W_t (arithmetic BM with drift μ in $/sec).
+
+    For zero drift (μ=0) this reduces to the Gaussian formula in touch_prob().
+    """
+    if a > b:
+        a, b = b, a
+    if sigma <= 0 or tau <= 0:
+        return 1.0 if (a <= P0 < b) else 0.0
+    if t_start <= 0:
+        return _touch_in_window_drift(P0, a, b, sigma, tau, mu)
+    # Integrate over P(t_start) ~ N(P0 + μ·t_start, σ²·t_start)
+    mean_at_start = P0 + mu * t_start
+    sig_gap = sigma * sqrt(t_start)
+    lo = mean_at_start - 6 * sig_gap
+    hi = mean_at_start + 6 * sig_gap
+    dx = (hi - lo) / (n_quad - 1)
+    total = 0.0
+    norm = 1.0 / (sig_gap * sqrt(2 * pi))
+    for i in range(n_quad):
+        x = lo + i * dx
+        w = norm * exp(-((x - mean_at_start) ** 2) / (2 * sig_gap ** 2))
+        total += w * _touch_in_window_drift(x, a, b, sigma, tau, mu) * dx
+    return max(0.0, min(1.0, total))
+
+
 def touch_prob(
     P0: float, a: float, b: float, sigma: float,
     t_start: float, tau: float,
