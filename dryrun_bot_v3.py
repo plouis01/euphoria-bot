@@ -399,6 +399,9 @@ def main():
     ap.add_argument("--slippage", type=int, default=60)
     ap.add_argument("--max-taps", type=int, default=2000)
     ap.add_argument("--max-loss", type=float, default=9999)
+    ap.add_argument("--max-gain", type=float, default=99999,
+                    help="Stop when realized_pnl >= this (LIVE: from ledger; "
+                         "DRY: from balance delta). Symmetric to max-loss.")
     ap.add_argument("--cadence-sec", type=float, default=8.0)
     ap.add_argument("--ev-threshold", type=float, default=0.05)
     ap.add_argument("--vol-window-sec", type=float, default=60.0)
@@ -778,6 +781,11 @@ def main():
                           f"(realized=${realized_pnl:+.4f}), stopping",
                           flush=True)
                     break
+                if realized_pnl >= args.max_gain:
+                    print(f"{TAG}[bot] LIVE max-gain ${args.max_gain} hit "
+                          f"(realized=${realized_pnl:+.4f}), stopping",
+                          flush=True)
+                    break
                 if (wins_eu + losses_eu) >= args.max_taps:
                     print(f"{TAG}[bot] LIVE max-taps {args.max_taps} hit "
                           f"(w/l={wins_eu}/{losses_eu}), stopping", flush=True)
@@ -862,6 +870,8 @@ def main():
             realized_pnl = cur_bal - starting_balance
             if not args.live and -realized_pnl >= args.max_loss:
                 print(f"{TAG}[bot] hit max-loss ${args.max_loss}", flush=True); break
+            if not args.live and realized_pnl >= args.max_gain:
+                print(f"{TAG}[bot] hit max-gain ${args.max_gain}", flush=True); break
             if taps >= args.max_taps:
                 print(f"{TAG}[bot] hit max-taps {args.max_taps}", flush=True); break
 
