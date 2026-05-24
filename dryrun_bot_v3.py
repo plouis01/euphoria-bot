@@ -37,6 +37,63 @@ from resolver import touched_band
 from touch_prob import (touch_prob, simulate_heston_paths,
                         touch_prob_heston_from_paths, touch_prob_drift)
 from redstone_chain_feed import RedStoneChainFeed
+import ssl
+import threading
+try:
+    import certifi
+    _SSL_CTX_NETMON = ssl.create_default_context(cafile=certifi.where())
+except ImportError:
+    _SSL_CTX_NETMON = ssl.create_default_context()
+
+
+class NetworkMonitor(threading.Thread):
+    """Active latency monitor — pings Euphoria's API every 10s. Tracks rolling
+    p95 RTT so the bot can skip bets when network is degraded (Option A from
+    LIVE_F4k4_v2 H4 analysis)."""
+
+    def __init__(self, url="https://mainnet.euphoria.finance/",
+                 interval_sec=10, maxlen=30):
+        super().__init__(daemon=True, name="netmon")
+        self.url = url
+        self.interval = interval_sec
+        self.rtts = deque(maxlen=maxlen)
+        self.lock = threading.Lock()
+        self._stop = threading.Event()
+
+    def run(self):
+        while not self._stop.is_set():
+            t0 = time.time()
+            try:
+                req = urllib.request.Request(
+                    self.url, method="HEAD",
+                    headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(
+                        req, timeout=3, context=_SSL_CTX_NETMON) as r:
+                    r.read(1)
+                dt_ms = int((time.time() - t0) * 1000)
+            except Exception:
+                dt_ms = 9999
+            with self.lock:
+                self.rtts.append(dt_ms)
+            self._stop.wait(self.interval)
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def p95(self) -> int:
+        with self.lock:
+            if not self.rtts:
+                return 0
+            srt = sorted(self.rtts)
+            idx = max(0, int(len(srt) * 0.95) - 1)
+            return srt[idx]
+
+    def median(self) -> int:
+        with self.lock:
+            if not self.rtts:
+                return 0
+            srt = sorted(self.rtts)
+            return srt[len(srt) // 2]
 
 
 PROXY = os.environ.get("PROXY", "http://127.0.0.1:8787")
@@ -519,6 +576,16 @@ def main():
                          "Per LIVE F4k4 analysis 2026-05-24, all 18 bets where "
                          "cell-distance > $1 lost (0%% WR). 1.0 recommended. "
                          "(Note: existing --min-quote-age-ms 1 covers clock-skew.)")
+    # ---- N5: network-latency ceiling (active monitor) ----
+    ap.add_argument("--max-network-latency-ms", type=int, default=99999,
+                    help="N5 filter: skip bet if p95 RTT to Euphoria API "
+                         "exceeds this. Active monitor pings every 10s. "
+                         "800ms recommended based on H4 analysis. 99999=off.")
+    # ---- Exclude-mult-range: skip middle-of-distribution mults ----
+    ap.add_argument("--exclude-mult-range", type=str, default="",
+                    help="Skip bets where quoted mult ∈ [lo, hi). Format: "
+                         "'4-7' excludes [4, 7). Empty=off. Use for bimodal "
+                         "edges where mid-range loses.")
     # ---- State persistence (survive bot restart without warmup-loss tax) ----
     ap.add_argument("--state-file", type=str,
                     default="logs/bot_filter_state.json",
@@ -641,6 +708,25 @@ def main():
     r1_skips = 0  # σ ceiling
     r3_skips = 0  # |drift| ceiling
     r4_skips = 0  # cell-distance ceiling
+    n5_skips = 0  # network-latency ceiling
+    excl_skips = 0  # exclude-mult-range
+
+    # Parse --exclude-mult-range "lo-hi"
+    excl_lo, excl_hi = None, None
+    if args.exclude_mult_range:
+        try:
+            parts = args.exclude_mult_range.split("-")
+            excl_lo = float(parts[0]); excl_hi = float(parts[1])
+        except (ValueError, IndexError):
+            print(f"{TAG}[bot] BAD --exclude-mult-range='{args.exclude_mult_range}', "
+                  "expected format 'lo-hi' e.g. '4-7'. IGNORED.", flush=True)
+            excl_lo = excl_hi = None
+
+    # Start netmon if enabled
+    netmon = None
+    if args.max_network_latency_ms < 99999:
+        netmon = NetworkMonitor()
+        netmon.start()
 
     # ---- v8 regime switcher ----
     rs_mode = args.rs_start_mode  # "HOT" or "COLD"
@@ -739,6 +825,12 @@ def main():
     if args.max_cell_distance < 99:
         print(f"{TAG}[bot] R4 cell-distance-ceiling ARMED "
               f"max_cell_distance=${args.max_cell_distance}", flush=True)
+    if args.max_network_latency_ms < 99999:
+        print(f"{TAG}[bot] N5 network-latency-ceiling ARMED "
+              f"max_p95_ms={args.max_network_latency_ms}", flush=True)
+    if excl_lo is not None:
+        print(f"{TAG}[bot] EXCLUDE-MULT-RANGE ARMED [{excl_lo}, {excl_hi})",
+              flush=True)
     if args.drift_aware_touch:
         print(f"{TAG}[bot] v9 DRIFT-AWARE TOUCH ARMED "
               f"conv_sec={args.drift_conv_sec} max_|μ|=${args.max_drift_mu}/s",
@@ -1245,6 +1337,27 @@ def main():
                     last_tap_ts = now
                     continue
 
+            # N5 network-latency ceiling: skip when Euphoria API is slow.
+            if netmon is not None:
+                p95 = netmon.p95()
+                if p95 > args.max_network_latency_ms:
+                    n5_skips += 1
+                    if int(now) % 8 == 0:
+                        print(f"{TAG}[bot] N5 SKIP latency p95={p95}ms > "
+                              f"{args.max_network_latency_ms}ms "
+                              f"(med={netmon.median()}ms)", flush=True)
+                    last_tap_ts = now
+                    continue
+
+            # EXCLUDE-MULT-RANGE: skip middle-of-distribution mults (bimodal edge).
+            if excl_lo is not None and excl_lo <= mult < excl_hi:
+                excl_skips += 1
+                if int(now) % 8 == 0:
+                    print(f"{TAG}[bot] EXCL SKIP mult={mult} in "
+                          f"[{excl_lo}, {excl_hi})", flush=True)
+                last_tap_ts = now
+                continue
+
             # F1 one-way-trend gate: record drift at signal time, then check
             # whether the last K signals are all strictly same-sign. If so,
             # abstain — Run #3 collapse pattern.
@@ -1379,6 +1492,7 @@ def main():
                   f"{wins_eu}/{losses_eu} realized=${ledger.realized_pnl:+.4f} "
                   f"f1_skips={f1_skips} f4_trips={f4_trips} "
                   f"r1_skips={r1_skips} r3_skips={r3_skips} r4_skips={r4_skips} "
+                  f"n5_skips={n5_skips} excl_skips={excl_skips} "
                   f"rs_mode={rs_mode} rs_transitions={rs_transitions} "
                   f"rs_cold_skips={rs_cold_skips}",
                   flush=True)
