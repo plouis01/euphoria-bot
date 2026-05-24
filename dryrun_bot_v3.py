@@ -513,6 +513,12 @@ def main():
                     help="R3 filter: skip if |drift_cb| > this. Per analysis, "
                          "|drift|>$0.50 had 0%% WR (n=7) excluding outlier. "
                          "0.50 recommended.")
+    # ---- R4: max cell distance from current price ($) ----
+    ap.add_argument("--max-cell-distance", type=float, default=999.0,
+                    help="R4 filter: skip if |band_center - P_now| > this ($). "
+                         "Per LIVE F4k4 analysis 2026-05-24, all 18 bets where "
+                         "cell-distance > $1 lost (0%% WR). 1.0 recommended. "
+                         "(Note: existing --min-quote-age-ms 1 covers clock-skew.)")
     # ---- State persistence (survive bot restart without warmup-loss tax) ----
     ap.add_argument("--state-file", type=str,
                     default="logs/bot_filter_state.json",
@@ -634,6 +640,7 @@ def main():
     f4_trips = 0
     r1_skips = 0  # σ ceiling
     r3_skips = 0  # |drift| ceiling
+    r4_skips = 0  # cell-distance ceiling
 
     # ---- v8 regime switcher ----
     rs_mode = args.rs_start_mode  # "HOT" or "COLD"
@@ -729,6 +736,9 @@ def main():
     if args.max_abs_drift < 99:
         print(f"{TAG}[bot] R3 |drift|-ceiling ARMED max_abs_drift=${args.max_abs_drift}",
               flush=True)
+    if args.max_cell_distance < 99:
+        print(f"{TAG}[bot] R4 cell-distance-ceiling ARMED "
+              f"max_cell_distance=${args.max_cell_distance}", flush=True)
     if args.drift_aware_touch:
         print(f"{TAG}[bot] v9 DRIFT-AWARE TOUCH ARMED "
               f"conv_sec={args.drift_conv_sec} max_|μ|=${args.max_drift_mu}/s",
@@ -1220,6 +1230,21 @@ def main():
                 last_tap_ts = now
                 continue
 
+            # R4 cell-distance ceiling: skip if the picked cell's band-center is
+            # too far from current price. Per LIVE F4k4 analysis 2026-05-24,
+            # all 18 bets at distance >$1 lost (0% WR).
+            if args.max_cell_distance < 999:
+                band_center = cy * PRICE_INTERVAL + PRICE_INTERVAL / 2
+                cell_dist = abs(band_center - P_now)
+                if cell_dist > args.max_cell_distance:
+                    r4_skips += 1
+                    if int(now) % 8 == 0:
+                        print(f"{TAG}[bot] R4 SKIP cell-distance "
+                              f"|cell-P|=${cell_dist:.2f} > "
+                              f"${args.max_cell_distance}", flush=True)
+                    last_tap_ts = now
+                    continue
+
             # F1 one-way-trend gate: record drift at signal time, then check
             # whether the last K signals are all strictly same-sign. If so,
             # abstain — Run #3 collapse pattern.
@@ -1353,7 +1378,7 @@ def main():
                   f"slip_rejects={slippage_rejects} settled_w/l="
                   f"{wins_eu}/{losses_eu} realized=${ledger.realized_pnl:+.4f} "
                   f"f1_skips={f1_skips} f4_trips={f4_trips} "
-                  f"r1_skips={r1_skips} r3_skips={r3_skips} "
+                  f"r1_skips={r1_skips} r3_skips={r3_skips} r4_skips={r4_skips} "
                   f"rs_mode={rs_mode} rs_transitions={rs_transitions} "
                   f"rs_cold_skips={rs_cold_skips}",
                   flush=True)
