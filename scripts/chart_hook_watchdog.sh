@@ -25,9 +25,10 @@ while true; do
     exit 0
   fi
 
-  # Poll /state
+  # Poll /state — health check includes frame freshness
   RESP=$(curl -s --max-time 4 http://127.0.0.1:8787/state 2>/dev/null)
   HEALTHY=0
+  FRAME_AGE_MS=-1
   if [ -n "$RESP" ]; then
     PRICE=$(echo "$RESP" | python3 -c "import sys,json
 try: d=json.load(sys.stdin); print(d.get('price'))
@@ -35,7 +36,17 @@ except: print('null')" 2>/dev/null)
     FB=$(echo "$RESP" | python3 -c "import sys,json
 try: d=json.load(sys.stdin); print(d.get('frameBuf', 0))
 except: print(0)" 2>/dev/null)
-    if [ "$PRICE" != "null" ] && [ "$PRICE" != "None" ] && [ "$FB" != "0" ]; then
+    # NEW: check chart frame age (price-Ts staleness)
+    FRAME_AGE_MS=$(echo "$RESP" | python3 -c "
+import sys, json, time
+try:
+    d = json.load(sys.stdin)
+    pts = d.get('priceTs')
+    if pts is None: print(-1)
+    else: print(int(time.time()*1000) - int(pts))
+except: print(-1)" 2>/dev/null)
+    # Healthy iff price not null, frameBuf > 0, AND frame age < 10s
+    if [ "$PRICE" != "null" ] && [ "$PRICE" != "None" ] && [ "$FB" != "0" ] && [ "$FRAME_AGE_MS" != "-1" ] && [ "$FRAME_AGE_MS" -lt 10000 ]; then
       HEALTHY=1
     fi
   fi
@@ -47,7 +58,7 @@ except: print(0)" 2>/dev/null)
     fi
   else
     STALE_COUNT=$((STALE_COUNT + 1))
-    log "chart STALE poll #$STALE_COUNT (price=$PRICE frameBuf=$FB)"
+    log "chart STALE poll #$STALE_COUNT (price=$PRICE frameBuf=$FB frame_age=${FRAME_AGE_MS}ms)"
     # Two consecutive stales = 10 min stale → recover
     if [ $STALE_COUNT -ge 2 ]; then
       RECOVERIES=$((RECOVERIES + 1))
