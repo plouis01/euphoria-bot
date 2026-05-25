@@ -570,6 +570,12 @@ def main():
                     help="R3 filter: skip if |drift_cb| > this. Per analysis, "
                          "|drift|>$0.50 had 0%% WR (n=7) excluding outlier. "
                          "0.50 recommended.")
+    # ---- Force drift sign (adaptive bot per PIVOT_PLAN_STATUS finding) ----
+    ap.add_argument("--force-drift-sign", type=int, default=0, choices=[-1, 0, 1],
+                    help="Override drift signal sign for cell selection. "
+                         "+1 = always bet UP (cells above current price), "
+                         "-1 = always bet DOWN, 0 = use actual drift (default). "
+                         "Test the finding that UP bets win where DOWN bets lose.")
     # ---- R4: max cell distance from current price ($) ----
     ap.add_argument("--max-cell-distance", type=float, default=999.0,
                     help="R4 filter: skip if |band_center - P_now| > this ($). "
@@ -1047,6 +1053,11 @@ def main():
             # ----- Drift signal (Coinbase - EU; USD-clean, RedStone-aligned) -----
             cb_price = cb_latest.price if cb_latest and cb_age_ms < 3000 else None
             drift_cb = (cb_price - e_price) if cb_price else 0.0
+
+            # Force drift sign if --force-drift-sign set (adaptive UP/DOWN bot)
+            if args.force_drift_sign != 0:
+                # Preserve magnitude, force sign
+                drift_cb = args.force_drift_sign * max(abs(drift_cb), 0.10)
 
             if cb_price is not None and abs(drift_cb) > args.max_drift:
                 if int(now) % 5 == 0:
