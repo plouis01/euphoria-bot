@@ -570,17 +570,17 @@ def main():
                     help="R3 filter: skip if |drift_cb| > this. Per analysis, "
                          "|drift|>$0.50 had 0%% WR (n=7) excluding outlier. "
                          "0.50 recommended.")
-    # ---- Use MM's implied prob (1/mq) as touch-prob basis ----
-    ap.add_argument("--use-mm-prior", action="store_true",
-                    help="Use 1/mq as touch-prob basis instead of Gaussian "
-                         "touch_prob model. ML calibration (2026-05-25) showed "
-                         "MM's implied prob matches actual WR within 5pp while "
-                         "Gaussian over-predicts by 12-15pp. EV becomes "
-                         "(mq*(1/mq) - 1) = 0 by definition, so combine with "
-                         "--use-mm-prior-blend <0..1> for a hybrid.")
-    ap.add_argument("--use-mm-prior-blend", type=float, default=1.0,
-                    help="Blend between Gaussian (0.0) and MM-implied (1.0). "
-                         "Default 1.0 = pure MM-implied. 0.5 = average.")
+    # ---- Use MM's implied prob (1/mq) as touch-prob basis (DEFAULT ON) ----
+    # ML calibration (2026-05-25) showed Gaussian over-predicts by 12-15pp
+    # while 1/mq matches actual WR within 5pp. This is the one durable fix.
+    ap.add_argument("--no-mm-prior", action="store_true",
+                    help="DISABLE the MM-prior calibration fix (default is "
+                         "enabled with 0.5 blend). Use Gaussian touch_prob "
+                         "alone (over-confident per 2026-05-25 ML analysis).")
+    ap.add_argument("--mm-prior-blend", type=float, default=0.5,
+                    help="Blend between Gaussian (0.0) and MM-implied 1/mq "
+                         "(1.0). Default 0.5 = average. Disabled when "
+                         "--no-mm-prior is set.")
     # ---- Regime gate (skip CHOPPY-FAST kill zone) ----
     ap.add_argument("--regime-gate", action="store_true",
                     help="Skip bets in CHOPPY-FAST regime: σ > 0.20 AND "
@@ -1171,14 +1171,14 @@ def main():
                 mu_eff = 0.0
 
             def _adjusted_p(p_gauss: float, mq: float) -> float:
-                """Apply --use-mm-prior blend: replaces Gaussian touch_prob
-                with 1/mq weighted by --use-mm-prior-blend. Per 2026-05-25 ML
-                calibration: Gaussian over-predicts by 12-15pp; MM_implied
-                matches actual within 5pp."""
-                if not args.use_mm_prior or mq <= 1.0:
+                """Apply MM-prior blend: blends Gaussian touch_prob with 1/mq.
+                Per 2026-05-25 ML calibration: Gaussian over-predicts by
+                12-15pp; MM_implied 1/mq matches actual WR within 5pp.
+                Default behavior is ON (blend=0.5); --no-mm-prior disables."""
+                if args.no_mm_prior or mq <= 1.0:
                     return p_gauss
                 p_mm = 1.0 / mq
-                blend = max(0.0, min(1.0, args.use_mm_prior_blend))
+                blend = max(0.0, min(1.0, args.mm_prior_blend))
                 return blend * p_mm + (1 - blend) * p_gauss
 
             def _touch(a: float, b: float, eff_ts: float, eff_tau: float) -> float:
