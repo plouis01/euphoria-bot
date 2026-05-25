@@ -10,8 +10,11 @@ Venues:
   - Bybit linear perp:      ETHUSDT  (wss://stream.bybit.com/v5/public/linear)
   - OKX swap:               ETH-USDT-SWAP (wss://ws.okx.com:8443/ws/v5/public)
 
-Venues NOT covered (and why):
-  - Hyperliquid: no dedicated liquidation WS topic (only general trades)
+Venues NOT covered here (and why):
+  - Hyperliquid: no SYSTEM-WIDE liquidation WS — only per-user via
+    userEvents/userFills subscriptions. Large HL prints are captured
+    in large_print_listener.py instead; post-hoc address matching against
+    HL liquidator addresses would be required for liquidation classification.
   - Coinbase: spot only on main exchange (no perps, no liquidations)
   - Coinbase INTX: requires paid auth for clean liquidation tape
 

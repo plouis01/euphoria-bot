@@ -1,4 +1,4 @@
-"""Listen for large trades across Binance + Coinbase ETH/USD spot.
+"""Listen for large trades across Binance, Coinbase, and Hyperliquid ETH.
 
 Extends the multi_exchange_oracle pattern (just prices) to also capture
 trade SIZE. Filters to "large prints" (default >= $50k USD notional) and
@@ -8,8 +8,16 @@ Hypothesis: large prints in either direction precede short-horizon vol
 spikes. If we detect them within 100s of milliseconds, we have an ex-ante
 warning signal that touch_prob model is about to break.
 
+Coverage:
+  - Binance spot (ETH/USDT @trade)
+  - Coinbase spot (ETH-USD matches channel)
+  - Hyperliquid perp (ETH trades — buyer/seller addresses included,
+    so liquidations can be identified post-hoc if liquidator addresses
+    are known)
+
 Output: logs/large_prints_<TS>.jsonl
-Each line: {"ts_ms", "venue", "side", "price", "qty", "usd"}
+Each line: {"ts_ms", "venue", "side", "price", "qty", "usd",
+            "buyer"?, "seller"?}
 """
 import asyncio
 import json
@@ -102,12 +110,48 @@ async def coinbase_matches(write):
             await asyncio.sleep(bk); bk = min(bk * 2, 60)
 
 
+async def hyperliquid_trades(write):
+    """Subscribe to HL ETH perp trades. Each msg includes users [buyer, seller]
+    so liquidations can be identified post-hoc by matching against known HL
+    liquidator addresses."""
+    url = "wss://api.hyperliquid.xyz/ws"
+    sub = json.dumps({"method": "subscribe",
+                      "subscription": {"type": "trades", "coin": "ETH"}})
+    bk = 1.0
+    while True:
+        try:
+            async with websockets.connect(url, ping_interval=20, ssl=SSL_CTX) as ws:
+                await ws.send(sub); bk = 1.0
+                async for msg in ws:
+                    d = json.loads(msg)
+                    if d.get("channel") != "trades": continue
+                    for t in d.get("data", []):
+                        price = float(t.get("px", 0)); qty = float(t.get("sz", 0))
+                        usd = price * qty
+                        if usd < MIN_USD: continue
+                        # HL side: 'A' = ask (sell aggressor), 'B' = bid (buy aggressor)
+                        raw_side = t.get("side", "")
+                        side = "SELL" if raw_side == "A" else "BUY" if raw_side == "B" else raw_side
+                        users = t.get("users", [None, None])
+                        write({
+                            "ts_ms": int(t.get("time", time.time() * 1000)),
+                            "venue": "hyperliquid", "side": side,
+                            "price": price, "qty": qty, "usd": usd,
+                            "buyer": users[0] if len(users) > 0 else None,
+                            "seller": users[1] if len(users) > 1 else None,
+                        })
+        except Exception as e:
+            print(f"  hyperliquid err: {e}", flush=True)
+            await asyncio.sleep(bk); bk = min(bk * 2, 60)
+
+
 async def main():
     out = open(out_path, "w")
     write = writer(out)
     start = time.time()
     tasks = [asyncio.create_task(binance_trades(write)),
-             asyncio.create_task(coinbase_matches(write))]
+             asyncio.create_task(coinbase_matches(write)),
+             asyncio.create_task(hyperliquid_trades(write))]
     try:
         await asyncio.wait_for(asyncio.gather(*tasks), timeout=RUNTIME_SEC)
     except asyncio.TimeoutError:
