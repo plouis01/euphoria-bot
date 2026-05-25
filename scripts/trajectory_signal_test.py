@@ -158,24 +158,20 @@ def summary(bets, label):
 
 
 def summary_with_jackknife(bets, label):
-    """Summary line + ex-top-3 and ex-top-20 jackknife."""
+    """Summary line with PROPORTIONAL jackknife: same fraction of bets removed
+    across subsets, so small and large subsets are comparable."""
     n, wins, pnl, per, t = _stats(bets)
     if n == 0: return f"  {label:<35} n=0"
     line = (f"  {label:<35} n={n:>4}  WR={wins/n*100:>5.1f}%  "
             f"$/tap=${per:>+7.3f} t={t:>+5.2f}")
-    # ex-top-3
-    ex3 = jackknife(bets, 3)
-    n3, _, pnl3, per3, t3 = _stats(ex3)
-    line += f"  | ex-top-3: $/tap=${per3:>+7.3f} t={t3:>+5.2f}"
-    # ex-top-20
-    ex20 = jackknife(bets, 20)
-    n20, _, pnl20, per20, t20 = _stats(ex20)
-    line += f"  | ex-top-20: $/tap=${per20:>+7.3f} t={t20:>+5.2f} (n={n20})"
-    # Top-20 share of PnL
-    if pnl != 0:
-        top20_pnl = pnl - pnl20
-        share = 100 * top20_pnl / pnl
-        line += f"  top20={share:.0f}%"
+    # Proportional jackknife: ex-top-1% and ex-top-2% (matched to baseline 2%
+    # of n=1000 ≈ top-20). For tiny subsets these become 1 or 2.
+    for pct, lbl in [(0.01, "ex-1%"), (0.02, "ex-2%"), (0.05, "ex-5%")]:
+        k = max(1, int(round(n * pct)))
+        if k >= n: continue
+        ex = jackknife(bets, k)
+        ne, _, pnle, pere, te = _stats(ex)
+        line += f"  | {lbl}(k={k}): $/tap=${pere:>+6.3f} t={te:>+5.2f}"
     return line
 
 
