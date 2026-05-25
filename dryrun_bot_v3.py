@@ -577,10 +577,13 @@ def main():
                     help="DISABLE the MM-prior calibration fix (default is "
                          "enabled with 0.5 blend). Use Gaussian touch_prob "
                          "alone (over-confident per 2026-05-25 ML analysis).")
-    ap.add_argument("--mm-prior-blend", type=float, default=0.5,
+    ap.add_argument("--mm-prior-blend", type=float, default=0.75,
                     help="Blend between Gaussian (0.0) and MM-implied 1/mq "
-                         "(1.0). Default 0.5 = average. Disabled when "
-                         "--no-mm-prior is set.")
+                         "(1.0). Default 0.75 per 2026-05-25 offline re-scoring: "
+                         "loser day -$62→-$2, winner day $/tap +0.208→+0.242. "
+                         "Disabled when --no-mm-prior is set. EV threshold "
+                         "applies AFTER blending: effective gauss-EV must "
+                         "exceed ev_threshold/(1-blend).")
     # ---- Regime gate (skip CHOPPY-FAST kill zone) ----
     ap.add_argument("--regime-gate", action="store_true",
                     help="Skip bets in CHOPPY-FAST regime: σ > 0.20 AND "
