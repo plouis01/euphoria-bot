@@ -570,6 +570,26 @@ def main():
                     help="R3 filter: skip if |drift_cb| > this. Per analysis, "
                          "|drift|>$0.50 had 0%% WR (n=7) excluding outlier. "
                          "0.50 recommended.")
+    # ---- Use MM's implied prob (1/mq) as touch-prob basis ----
+    ap.add_argument("--use-mm-prior", action="store_true",
+                    help="Use 1/mq as touch-prob basis instead of Gaussian "
+                         "touch_prob model. ML calibration (2026-05-25) showed "
+                         "MM's implied prob matches actual WR within 5pp while "
+                         "Gaussian over-predicts by 12-15pp. EV becomes "
+                         "(mq*(1/mq) - 1) = 0 by definition, so combine with "
+                         "--use-mm-prior-blend <0..1> for a hybrid.")
+    ap.add_argument("--use-mm-prior-blend", type=float, default=1.0,
+                    help="Blend between Gaussian (0.0) and MM-implied (1.0). "
+                         "Default 1.0 = pure MM-implied. 0.5 = average.")
+    # ---- Regime gate (skip CHOPPY-FAST kill zone) ----
+    ap.add_argument("--regime-gate", action="store_true",
+                    help="Skip bets in CHOPPY-FAST regime: σ > 0.20 AND "
+                         "30-min KER < 0.10. Per 2026-05-25 backtest, this "
+                         "regime accounted for -$53 of yesterday's losses.")
+    ap.add_argument("--regime-sigma-threshold", type=float, default=0.20,
+                    help="σ ceiling for regime classifier. Default 0.20.")
+    ap.add_argument("--regime-ker-threshold", type=float, default=0.10,
+                    help="KER floor for regime classifier. Default 0.10.")
     # ---- Force drift sign (adaptive bot per PIVOT_PLAN_STATUS finding) ----
     ap.add_argument("--force-drift-sign", type=int, default=0, choices=[-1, 0, 1],
                     help="Override drift signal sign for cell selection. "
@@ -716,6 +736,9 @@ def main():
     r4_skips = 0  # cell-distance ceiling
     n5_skips = 0  # network-latency ceiling
     excl_skips = 0  # exclude-mult-range
+    regime_skips = 0  # CHOPPY-FAST regime gate
+    # Rolling 30-min price tape for KER computation (used by --regime-gate)
+    regime_tape: deque = deque(maxlen=10000)
 
     # Parse --exclude-mult-range "lo-hi"
     excl_lo, excl_hi = None, None
@@ -1054,6 +1077,31 @@ def main():
             cb_price = cb_latest.price if cb_latest and cb_age_ms < 3000 else None
             drift_cb = (cb_price - e_price) if cb_price else 0.0
 
+            # Regime gate: skip if σ > threshold AND KER < threshold (kill zone)
+            if args.regime_gate and e_price is not None:
+                regime_tape.append((time.time(), e_price))
+                cutoff = time.time() - 1800  # 30 min lookback
+                while regime_tape and regime_tape[0][0] < cutoff:
+                    regime_tape.popleft()
+                # sigma is computed later in the loop; use coinbase.realized_vol here
+                _sigma_now = coinbase.realized_vol_per_sec(300_000)
+                if len(regime_tape) >= 30 and _sigma_now is not None:
+                    sigma_for_gate = _sigma_now
+                    prices_30 = [p for _, p in regime_tape]
+                    net = abs(prices_30[-1] - prices_30[0])
+                    path = sum(abs(prices_30[i+1] - prices_30[i])
+                                for i in range(len(prices_30) - 1))
+                    ker = (net / path) if path > 0 else 0
+                    if sigma_for_gate > args.regime_sigma_threshold and ker < args.regime_ker_threshold:
+                        regime_skips += 1
+                        if int(time.time()) % 10 == 0:
+                            print(f"{TAG}[bot] REGIME-GATE SKIP "
+                                  f"σ={sigma_for_gate:.3f}>{args.regime_sigma_threshold} "
+                                  f"AND KER={ker:.3f}<{args.regime_ker_threshold} "
+                                  f"(CHOPPY-FAST)", flush=True)
+                        time.sleep(1.0)
+                        continue
+
             # Force drift sign if --force-drift-sign set (adaptive UP/DOWN bot)
             if args.force_drift_sign != 0:
                 # Preserve magnitude, force sign
@@ -1122,6 +1170,17 @@ def main():
             else:
                 mu_eff = 0.0
 
+            def _adjusted_p(p_gauss: float, mq: float) -> float:
+                """Apply --use-mm-prior blend: replaces Gaussian touch_prob
+                with 1/mq weighted by --use-mm-prior-blend. Per 2026-05-25 ML
+                calibration: Gaussian over-predicts by 12-15pp; MM_implied
+                matches actual within 5pp."""
+                if not args.use_mm_prior or mq <= 1.0:
+                    return p_gauss
+                p_mm = 1.0 / mq
+                blend = max(0.0, min(1.0, args.use_mm_prior_blend))
+                return blend * p_mm + (1 - blend) * p_gauss
+
             def _touch(a: float, b: float, eff_ts: float, eff_tau: float) -> float:
                 """Dispatch to the configured touch-prob model."""
                 if heston_paths is not None:
@@ -1181,7 +1240,8 @@ def main():
                     a = cy * PRICE_INTERVAL; b = a + PRICE_INTERVAL
                     p = _touch(a, b, eff_ts, eff_tau)
                     if p < args.min_p or p > args.max_p: continue
-                    p_eff = cal2.adjust(p, sigma, drift_cb) if cal2 is not None else p
+                    p_cal = cal2.adjust(p, sigma, drift_cb) if cal2 is not None else p
+                    p_eff = _adjusted_p(p_cal, m)
                     ev = m * p_eff - 1
                     scored += 1
                     if best_local is None or ev > best_local["ev"]:
@@ -1210,7 +1270,8 @@ def main():
                 eff_ts = max(0.0, t_start)
                 eff_tau = TIME_INTERVAL if t_start >= 0 else TIME_INTERVAL + t_start
                 p = _touch(pick["a"], pick["b"], eff_ts, eff_tau)
-                p_eff = cal2.adjust(p, sigma, drift_cb) if cal2 is not None else p
+                p_cal = cal2.adjust(p, sigma, drift_cb) if cal2 is not None else p
+                p_eff = _adjusted_p(p_cal, pick["mult"])
                 ev = pick["mult"] * p_eff - 1
                 return {"cx": pick["cx"], "cy": pick["cy"], "mult": pick["mult"],
                         "p": p, "ev": ev, "strategy": label}
@@ -1242,7 +1303,8 @@ def main():
                         eff_tau = TIME_INTERVAL if t_start >= 0 else TIME_INTERVAL + t_start
                         if eff_tau <= 0: continue
                         p = _touch(a, b, eff_ts, eff_tau)
-                        p_eff = cal2.adjust(p, sigma, drift_cb) if cal2 is not None else p
+                        p_cal = cal2.adjust(p, sigma, drift_cb) if cal2 is not None else p
+                        p_eff = _adjusted_p(p_cal, m)
                         ev = m * p_eff - 1
                         best_d = d
                         best_local = {"cx": cx, "cy": cy, "mult": m, "p": p,
