@@ -584,6 +584,17 @@ def main():
                          "Disabled when --no-mm-prior is set. EV threshold "
                          "applies AFTER blending: effective gauss-EV must "
                          "exceed ev_threshold/(1-blend).")
+    # ---- mq trajectory filter (per TRAJECTORY_SIGNAL_FINDINGS.md) ----
+    ap.add_argument("--rmq-filter-threshold", type=float, default=0.0,
+                    help="If >0, require chosen cell's rmq_5s (mq_now / "
+                         "mq_5s_ago) to be < this value before firing. "
+                         "0.80 = MM must have cut mult by >20%% in last 5s. "
+                         "0.0 = filter disabled (default). Backtest on "
+                         "winner-day winner-regime shows rmq<0.80 subset "
+                         "stays positive through ex-2%% jackknife where "
+                         "baseline is negative. Single-day data, unvalidated.")
+    ap.add_argument("--rmq-filter-window-sec", type=float, default=5.0,
+                    help="Lookback window for rmq filter (default 5s).")
     # ---- Regime gate (skip CHOPPY-FAST kill zone) ----
     ap.add_argument("--regime-gate", action="store_true",
                     help="Skip bets in CHOPPY-FAST regime: σ > 0.20 AND "
@@ -1197,9 +1208,9 @@ def main():
                 return touch_prob(P_now, a, b, sigma, eff_ts, eff_tau,
                                   df=args.vol_df)
 
-            # Update per-cell mult history (for --min-quote-mult-change-pct).
-            if args.min_quote_mult_change_pct > 0:
-                cutoff_ms = now_ms - int(args.quote_change_window_sec * 1000) - 5000
+            # Update per-cell mult history (for --min-quote-mult-change-pct
+            # AND --rmq-filter-threshold).
+            if args.min_quote_mult_change_pct > 0 or args.rmq_filter_threshold > 0:
                 for c in cells:
                     k = (c["cellX"], c["cellY"])
                     h = cell_mult_history.get(k)
@@ -1211,6 +1222,20 @@ def main():
                 if len(cell_mult_history) > 5000:
                     keep_keys = {(c["cellX"], c["cellY"]) for c in cells}
                     cell_mult_history = {k: v for k, v in cell_mult_history.items() if k in keep_keys}
+
+            def rmq_at_window(cx: int, cy: int, window_sec: float):
+                """Return current_mq / mq_window_sec_ago, or None if no history."""
+                h = cell_mult_history.get((cx, cy))
+                if h is None or len(h) < 2: return None
+                target_ms = now_ms - int(window_sec * 1000)
+                # latest entry <= target_ms
+                old = None
+                for ts, m in h:
+                    if ts <= target_ms: old = (ts, m)
+                    else: break
+                if old is None or old[1] <= 0: return None
+                cur = h[-1][1]
+                return cur / old[1]
 
             def cell_mult_changed_enough(cx: int, cy: int) -> bool:
                 if args.min_quote_mult_change_pct <= 0:
@@ -1356,6 +1381,22 @@ def main():
                           f"ev_adj={ev_adj:+.3f} cell=({best['cx']},{best['cy']}) "
                           f"mult={best['mult']} p={best['p']:.3f}", flush=True)
                 time.sleep(0.5); continue
+
+            # ---- mq trajectory filter ----
+            if args.rmq_filter_threshold > 0:
+                rmq = rmq_at_window(best["cx"], best["cy"],
+                                    args.rmq_filter_window_sec)
+                if rmq is None:
+                    print(f"{TAG}[bot] rmq-skip cell=({best['cx']},{best['cy']}) "
+                          f"no_history (need {args.rmq_filter_window_sec}s "
+                          f"of cell quotes)", flush=True)
+                    time.sleep(0.5); continue
+                if rmq >= args.rmq_filter_threshold:
+                    print(f"{TAG}[bot] rmq-skip cell=({best['cx']},{best['cy']}) "
+                          f"rmq={rmq:.3f} >= threshold "
+                          f"{args.rmq_filter_threshold} (MM hasn't cut mult enough)",
+                          flush=True)
+                    time.sleep(0.5); continue
 
             cx, cy, mult, p, ev = (best["cx"], best["cy"], best["mult"],
                                    best["p"], best["ev"])
