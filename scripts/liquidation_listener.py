@@ -1,4 +1,4 @@
-"""Listen to ETH perpetual liquidation streams across multiple CEX.
+"""Listen to ETH perpetual liquidation streams across multiple CEX/DEX.
 
 Free real-time liquidation tape for cross-referencing with bot signals.
 Hypothesis: when liquidations cluster, ETH realized vol spikes and our
@@ -6,21 +6,24 @@ touch_prob model breaks. A clustering detector could be an ex-ante regime
 gate.
 
 Venues:
-  - Binance USDT-M futures: ETHUSDT  (wss://fstream.binance.com)
-  - Bybit linear perp:      ETHUSDT  (wss://stream.bybit.com/v5/public/linear)
-  - OKX swap:               ETH-USDT-SWAP (wss://ws.okx.com:8443/ws/v5/public)
+  - Bybit linear perp:   ETHUSDT  (wss://stream.bybit.com/v5/public/linear)
+  - OKX swap:            ETH-USDT-SWAP (wss://ws.okx.com:8443/ws/v5/public)
+  - Hyperliquid:         ETH perp trades, filtered to HLP-vault counterparty
+                         (vault=0xdfc24b...303 performs HL liquidations)
 
 Venues NOT covered here (and why):
-  - Hyperliquid: no SYSTEM-WIDE liquidation WS — only per-user via
-    userEvents/userFills subscriptions. Large HL prints are captured
-    in large_print_listener.py instead; post-hoc address matching against
-    HL liquidator addresses would be required for liquidation classification.
+  - Binance USDT-M futures: silently geo-blocked from this IP.
+    fapi.binance.com REST returns HTTP 200, but ALL futures WS streams
+    (fstream.binance.com/*, including !forceOrder@arr, btcusdt@aggTrade,
+    ethusdt@aggTrade) accept connections then never deliver messages.
+    Tested 2026-05-25: 0 messages in 60s across all variants. spot streams
+    via data-stream.binance.vision work fine; futures equivalents
+    (fstream-mm) return HTTP 403. No proxy-free fix available.
   - Coinbase: spot only on main exchange (no perps, no liquidations)
   - Coinbase INTX: requires paid auth for clean liquidation tape
 
 NOTE: historical aggregated heatmap data (CoinGlass-style) requires paid
-access. This listener only captures going-forward. Backtest against past
-bet logs is not feasible without paid CoinGlass / Coinalyze data.
+access. This listener only captures going-forward.
 
 Output: logs/liquidations_<TS>.jsonl
 Each line: {"ts_ms", "venue", "symbol", "side", "qty", "price", "usd"}
@@ -42,9 +45,11 @@ ts_label = time.strftime("%Y%m%d_%H%M%S")
 out_path = ROOT / "logs" / f"liquidations_{ts_label}.jsonl"
 print(f"output: {out_path}", flush=True)
 
+HLP_VAULT = "0xdfc24b077bc1425ad1dea75bcb6f8158e10df303"
+
 # Shared writer
 out_file = open(out_path, "w")
-counts = {"binance": 0, "bybit": 0, "okx": 0}
+counts = {"bybit": 0, "okx": 0, "hyperliquid": 0}
 last_status = [time.time()]
 write_lock = asyncio.Lock()
 
@@ -59,29 +64,42 @@ async def write_event(rec):
             last_status[0] = time.time()
 
 
-async def binance_feed():
-    """Binance USDT-M futures forceOrder stream (ALL symbols, we filter ETH)."""
-    url = "wss://fstream.binance.com/ws/!forceOrder@arr"
+async def hyperliquid_feed():
+    """Subscribe to HL ETH perp trades. Write only trades where HLP vault
+    (0xdfc24b...303) is buyer or seller — those are backstop liquidations.
+    Per HL docs: HLP 'performs liquidations' and is a community-owned vault."""
+    url = "wss://api.hyperliquid.xyz/ws"
+    sub = json.dumps({"method": "subscribe",
+                      "subscription": {"type": "trades", "coin": "ETH"}})
     bk = 1.0
     while True:
         try:
             async with websockets.connect(url, ping_interval=20, ssl=SSL_CTX) as ws:
-                bk = 1.0
+                await ws.send(sub); bk = 1.0
                 async for msg in ws:
                     try: d = json.loads(msg)
                     except: continue
-                    o = d.get("o", {})
-                    if o.get("s") != "ETHUSDT": continue
-                    qty = float(o.get("q", 0))
-                    price = float(o.get("ap", 0) or o.get("p", 0))
-                    await write_event({
-                        "ts_ms": int(o.get("T", time.time() * 1000)),
-                        "venue": "binance", "symbol": "ETHUSDT",
-                        "side": o.get("S"), "qty": qty, "price": price,
-                        "usd": qty * price,
-                    })
+                    if d.get("channel") != "trades": continue
+                    for t in d.get("data", []):
+                        users = t.get("users", [None, None])
+                        buyer = (users[0] or "").lower()
+                        seller = (users[1] or "").lower() if len(users) > 1 else ""
+                        if HLP_VAULT not in (buyer, seller): continue
+                        price = float(t.get("px", 0)); qty = float(t.get("sz", 0))
+                        # When HLP is buyer, HLP is taking over a liquidated LONG
+                        # (which was being sold to close) → side relative to
+                        # liquidated position is SELL. Mirror Binance convention:
+                        # 'side' = side of the liquidation order (NOT HLP's side).
+                        side = "SELL" if buyer == HLP_VAULT else "BUY"
+                        await write_event({
+                            "ts_ms": int(t.get("time", time.time() * 1000)),
+                            "venue": "hyperliquid", "symbol": "ETH",
+                            "side": side, "qty": qty, "price": price,
+                            "usd": qty * price,
+                            "hlp_role": "buyer" if buyer == HLP_VAULT else "seller",
+                        })
         except Exception as e:
-            print(f"  binance err: {e}", flush=True)
+            print(f"  hyperliquid err: {e}", flush=True)
             await asyncio.sleep(bk); bk = min(bk * 2, 60)
 
 
@@ -155,11 +173,12 @@ async def okx_feed():
 
 async def main():
     start = time.time()
-    print(f"runtime: {RUNTIME_SEC}s   venues: binance, bybit, okx", flush=True)
+    print(f"runtime: {RUNTIME_SEC}s   venues: bybit, okx, hyperliquid",
+          flush=True)
     tasks = [
-        asyncio.create_task(binance_feed()),
         asyncio.create_task(bybit_feed()),
         asyncio.create_task(okx_feed()),
+        asyncio.create_task(hyperliquid_feed()),
     ]
     try:
         await asyncio.wait_for(asyncio.gather(*tasks), timeout=RUNTIME_SEC)
