@@ -467,7 +467,16 @@ def main():
     ap.add_argument("--max-drift", type=float, default=5.0,
                     help="pause if |Coinbase - EU| > this (real drift gate, "
                          "uses Coinbase not Binance to avoid USDT basis)")
-    ap.add_argument("--max-euphoria-price-age-s", type=float, default=5.0)
+    ap.add_argument("--max-euphoria-price-age-s", type=float, default=2.0,
+                    help="Skip bet if EU chart frame age exceeds this. "
+                         "Default 2s (tightened from 5s after 2026-05-26 "
+                         "incident: chart hook stalled for hours but bot kept "
+                         "firing during brief fresh-frame moments).")
+    ap.add_argument("--min-priceTs-updates-10s", type=int, default=3,
+                    help="Require >=N distinct priceTs values in the last 10s "
+                         "before betting. Prevents firing on a single fresh "
+                         "frame in an otherwise-stale stream. Default 3, "
+                         "set to 0 to disable.")
     ap.add_argument("--max-quote-age-ms", type=int, default=400,
                     help="skip if MM grid age > this (freshness gate, #3)")
     ap.add_argument("--max-time-out-sec", type=float, default=120.0)
@@ -769,6 +778,12 @@ def main():
     regime_skips = 0  # CHOPPY-FAST regime gate
     # Rolling 30-min price tape for KER computation (used by --regime-gate)
     regime_tape: deque = deque(maxlen=10000)
+
+    # ---- priceTs freshness buffer (defense against stale-then-blip pattern) ----
+    # Each entry: (poll_time_ms, priceTs). Look back 10s to count distinct
+    # priceTs values; require N distinct to consider the chart truly live.
+    priceTs_buf: deque = deque(maxlen=200)  # ~10s @ ~20Hz polling
+    stale_blip_skips = 0
 
     # ---- Live liquidation tape (for --liq-count-60s-max) ----
     # Tail the most-recent liquidations_*.jsonl file. Track seek position
@@ -1121,10 +1136,27 @@ def main():
             e_price = st.get("price"); e_priceTs = st.get("priceTs")
             if e_price is None or e_priceTs is None:
                 time.sleep(0.5); continue
-            e_age_ms = int(time.time() * 1000) - int(e_priceTs)
+            now_ms_local = int(time.time() * 1000)
+            e_age_ms = now_ms_local - int(e_priceTs)
             if e_age_ms > args.max_euphoria_price_age_s * 1000:
-                print(f"{TAG}[bot] EU price stale ({e_age_ms}ms)", flush=True)
+                print(f"{TAG}[bot] EU price stale ({e_age_ms}ms > "
+                      f"{int(args.max_euphoria_price_age_s*1000)}ms)", flush=True)
                 time.sleep(0.5); continue
+
+            # Track recent priceTs values — defend against single-fresh-frame-
+            # in-stale-stream pattern. Require N distinct priceTs in last 10s.
+            priceTs_buf.append((now_ms_local, int(e_priceTs)))
+            if args.min_priceTs_updates_10s > 0:
+                cutoff = now_ms_local - 10_000
+                recent_pts = {pts for (t, pts) in priceTs_buf if t >= cutoff}
+                if len(recent_pts) < args.min_priceTs_updates_10s:
+                    stale_blip_skips += 1
+                    if int(now) % 5 == 0:
+                        print(f"{TAG}[bot] stale-blip skip: only "
+                              f"{len(recent_pts)} distinct priceTs in last 10s "
+                              f"(need {args.min_priceTs_updates_10s})",
+                              flush=True)
+                    time.sleep(0.5); continue
 
             cb_latest = coinbase.latest()
             cb_age_ms = (int(time.time() * 1000) - cb_latest.ts_ms) if cb_latest else 999_999
