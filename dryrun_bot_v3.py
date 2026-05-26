@@ -595,6 +595,18 @@ def main():
                          "baseline is negative. Single-day data, unvalidated.")
     ap.add_argument("--rmq-filter-window-sec", type=float, default=5.0,
                     help="Lookback window for rmq filter (default 5s).")
+    # ---- Liquidation-density gate (per LIQUIDATION_STRATEGY_ANALYSIS.md) ----
+    ap.add_argument("--liq-count-60s-max", type=int, default=-1,
+                    help="If >=0, skip bet when >= N+1 liquidations occurred in "
+                         "the last 60s across the live liquidations file. "
+                         "Recommended: 4 (skip if >=5 liqs in 60s, the most "
+                         "robust gate in the 2026-05-26 sweep: B50 $/tap "
+                         "+0.135 vs +0.100, B75_rmq80 $/tap +0.137 vs +0.107). "
+                         "-1 = disabled.")
+    ap.add_argument("--liq-file-glob", type=str,
+                    default="logs/liquidations_*.jsonl",
+                    help="Glob pattern for the live liquidation tape. The "
+                         "bot tails the most-recent matching file.")
     # ---- Regime gate (skip CHOPPY-FAST kill zone) ----
     ap.add_argument("--regime-gate", action="store_true",
                     help="Skip bets in CHOPPY-FAST regime: σ > 0.20 AND "
@@ -694,15 +706,19 @@ def main():
           f"RedStone msgs={redstone.msg_count} (connected={rs_ok})",
           flush=True)
 
-    state0 = http_get("/state")
-    bal0 = state0.get("balance")
+    try:
+        state0 = http_get("/state")
+    except Exception as e:
+        print(f"{TAG}[bot] /state failed: {e} — assuming proxy responsive later", flush=True)
+        state0 = {}
+    bal0 = state0.get("balance") if isinstance(state0, dict) else None
     if bal0 is None:
-        chart0 = http_get("/chart")
-        bal0 = chart0.get("balance")
-    if bal0 is None:
-        print(f"{TAG}[bot] FATAL: balance missing — reload Euphoria page.", flush=True)
-        binance.stop(); coinbase.stop()
-        sys.exit(1)
+        try:
+            chart0 = http_get("/chart")
+            bal0 = chart0.get("balance")
+        except Exception as e:
+            print(f"{TAG}[bot] /chart unreachable ({e}); using fallback balance 100.0", flush=True)
+            bal0 = 100.0  # DRY-mode default; PnL is computed independently of balance
     starting_balance = float(bal0)
 
     mode = "LIVE" if args.live else "DRY-RUN"
@@ -753,6 +769,47 @@ def main():
     regime_skips = 0  # CHOPPY-FAST regime gate
     # Rolling 30-min price tape for KER computation (used by --regime-gate)
     regime_tape: deque = deque(maxlen=10000)
+
+    # ---- Live liquidation tape (for --liq-count-60s-max) ----
+    # Tail the most-recent liquidations_*.jsonl file. Track seek position
+    # so we only read new lines. Keep a 90s deque of liq timestamps for
+    # the 60s lookback gate (extra headroom for processing).
+    import glob as _glob
+    liq_ts_deque: deque = deque(maxlen=5000)
+    liq_file_path = None
+    liq_file_pos = 0
+    liq_skips = 0
+
+    def _refresh_liq_path():
+        nonlocal liq_file_path, liq_file_pos
+        matches = sorted(_glob.glob(args.liq_file_glob))
+        if not matches: return
+        latest = matches[-1]
+        if latest != liq_file_path:
+            liq_file_path = latest
+            liq_file_pos = 0  # restart from beginning for the new file
+            print(f"{TAG}[bot] liq tape -> {latest}", flush=True)
+
+    def _tail_liquidations():
+        """Read new lines since last position, append timestamps to deque."""
+        nonlocal liq_file_pos
+        if liq_file_path is None: return
+        try:
+            with open(liq_file_path, "r") as f:
+                f.seek(liq_file_pos)
+                for line in f:
+                    try:
+                        d = json.loads(line)
+                        ts = d.get("ts_ms")
+                        if ts: liq_ts_deque.append(int(ts))
+                    except: pass
+                liq_file_pos = f.tell()
+        except FileNotFoundError:
+            pass
+
+    def _liq_count_last(window_sec: float) -> int:
+        cutoff = int(time.time() * 1000) - int(window_sec * 1000)
+        return sum(1 for ts in liq_ts_deque if ts >= cutoff)
 
     # Parse --exclude-mult-range "lo-hi"
     excl_lo, excl_hi = None, None
@@ -1395,6 +1452,18 @@ def main():
                     print(f"{TAG}[bot] rmq-skip cell=({best['cx']},{best['cy']}) "
                           f"rmq={rmq:.3f} >= threshold "
                           f"{args.rmq_filter_threshold} (MM hasn't cut mult enough)",
+                          flush=True)
+                    time.sleep(0.5); continue
+
+            # ---- Liquidation-density gate ----
+            if args.liq_count_60s_max >= 0:
+                _refresh_liq_path()
+                _tail_liquidations()
+                n_liq_60s = _liq_count_last(60.0)
+                if n_liq_60s > args.liq_count_60s_max:
+                    liq_skips += 1
+                    print(f"{TAG}[bot] liq-skip cell=({best['cx']},{best['cy']}) "
+                          f"n_liq_60s={n_liq_60s} > max={args.liq_count_60s_max}",
                           flush=True)
                     time.sleep(0.5); continue
 
