@@ -39,6 +39,14 @@ FILTERS = [
     ("liq_n_60s < 3",             lambda b: b["liq_n_60s"] < 3),
 ]
 
+# Multi-window analysis — lookback windows in seconds
+LOOKBACK_WINDOWS = [1, 2, 5, 10, 20, 30, 60]
+# Filter thresholds (count-based and notional-based) applied at every window
+COUNT_THRESHOLDS = [3, 5]
+USD_THRESHOLDS = [100_000, 250_000]
+# Price aftermath horizons
+AFTERMATH_HORIZONS = [1, 2, 5, 10, 20, 30, 60]
+
 
 def parse_bets(log_path, bot_tag):
     sig_re = re.compile(
@@ -179,19 +187,23 @@ def main():
 
     summary_rows = {}  # for later ranking
 
+    # Precompute features once per bot at all windows
+    all_bot_bets = {}
     for bot_tag, log_rel in LOGS_TO_ANALYZE:
         bets = parse_bets(ROOT / log_rel, bot_tag)
-        # Enrich with liq features
         for b in bets:
             T = b["bet_ts_ms"]
-            win60 = liq_window(liqs, liq_ts, T, 60)
-            b["liq_n_60s"] = len(win60)
-            b["liq_usd_60s"] = sum(x["usd"] for x in win60)
-        # Restrict to bets within liq observation window so filters are
-        # meaningful (otherwise zero-liq always passes by default)
+            for w_sec in LOOKBACK_WINDOWS:
+                win = liq_window(liqs, liq_ts, T, w_sec)
+                b[f"liq_n_{w_sec}s"] = len(win)
+                b[f"liq_usd_{w_sec}s"] = sum(x["usd"] for x in win)
+        # alias 60s features for the existing FILTERS (which reference _60s)
         if liqs:
             bets = [b for b in bets if liqs[0]["ts_ms"] <= b["bet_ts_ms"] <= liqs[-1]["ts_ms"]]
+        all_bot_bets[bot_tag] = bets
 
+    for bot_tag, log_rel in LOGS_TO_ANALYZE:
+        bets = all_bot_bets[bot_tag]
         for filt_name, filt_fn in FILTERS:
             kept = [b for b in bets if filt_fn(b)]
             dropped = [b for b in bets if not filt_fn(b)]
@@ -217,6 +229,73 @@ def main():
             out.append(f"- {filt}: n={n}, $/tap=${per:+.3f}, t={t:+.2f}, PnL=${pnl:+.2f}")
         out.append("")
 
+    # ============ Part 1b: multi-window filter sweep ============
+    out.append("---")
+    out.append("")
+    out.append("## Part 1b — Multi-window filter sweep")
+    out.append("")
+    out.append("Same counterfactual filter application, but lookback window varied across "
+               "{1s, 2s, 5s, 10s, 20s, 30s, 60s}. Each row shows kept-set $/tap (t-stat).")
+    out.append("")
+    out.append("**Best per-row cell highlighted by reading down the column.** Look for which "
+               "lookback window maximizes $/tap for each filter type.")
+    out.append("")
+
+    for bot_tag in [t for t, _ in LOGS_TO_ANALYZE]:
+        bets = all_bot_bets[bot_tag]
+        n_baseline, _, pnl_baseline, per_baseline, t_baseline = stats_of(bets)
+        out.append(f"### {bot_tag}  (baseline n={n_baseline}, $/tap=${per_baseline:+.3f}, t={t_baseline:+.2f})")
+        out.append("")
+        # Count-threshold table
+        out.append(f"**COUNT-based filters** (skip if liq_n_Xs >= threshold)")
+        out.append("")
+        header = "| Lookback |" + "|".join(f" count<{k} " for k in COUNT_THRESHOLDS) + "|"
+        out.append(header)
+        out.append("|---|" + "|".join("---:" for _ in COUNT_THRESHOLDS) + "|")
+        for w_sec in LOOKBACK_WINDOWS:
+            cells = [f"{w_sec}s"]
+            for thr in COUNT_THRESHOLDS:
+                kept = [b for b in bets if b[f"liq_n_{w_sec}s"] < thr]
+                n, _, pnl, per, t = stats_of(kept)
+                drop_n = len(bets) - n
+                cells.append(f" ${per:+.3f} t={t:+.2f} (n={n}, drop={drop_n}) ")
+            out.append("| " + " | ".join(cells) + " |")
+        out.append("")
+        # USD-threshold table
+        out.append(f"**NOTIONAL-based filters** (skip if liq_usd_Xs >= threshold)")
+        out.append("")
+        header = "| Lookback |" + "|".join(f" usd<${k//1000}k " for k in USD_THRESHOLDS) + "|"
+        out.append(header)
+        out.append("|---|" + "|".join("---:" for _ in USD_THRESHOLDS) + "|")
+        for w_sec in LOOKBACK_WINDOWS:
+            cells = [f"{w_sec}s"]
+            for thr in USD_THRESHOLDS:
+                kept = [b for b in bets if b[f"liq_usd_{w_sec}s"] < thr]
+                n, _, pnl, per, t = stats_of(kept)
+                drop_n = len(bets) - n
+                cells.append(f" ${per:+.3f} t={t:+.2f} (n={n}, drop={drop_n}) ")
+            out.append("| " + " | ".join(cells) + " |")
+        out.append("")
+
+        # Best of all (count*window, usd*window) by $/tap
+        best = []
+        for w_sec in LOOKBACK_WINDOWS:
+            for thr in COUNT_THRESHOLDS:
+                kept = [b for b in bets if b[f"liq_n_{w_sec}s"] < thr]
+                n, _, pnl, per, t = stats_of(kept)
+                if n >= 50:
+                    best.append((per, t, n, f"count<{thr} @ {w_sec}s", pnl))
+            for thr in USD_THRESHOLDS:
+                kept = [b for b in bets if b[f"liq_usd_{w_sec}s"] < thr]
+                n, _, pnl, per, t = stats_of(kept)
+                if n >= 50:
+                    best.append((per, t, n, f"usd<${thr//1000}k @ {w_sec}s", pnl))
+        best.sort(reverse=True)
+        out.append(f"**Top 5 (bot {bot_tag}) by $/tap, min n=50:**")
+        for per, t, n, lbl, pnl in best[:5]:
+            out.append(f"- {lbl}: n={n}, $/tap=${per:+.3f}, t={t:+.2f}, PnL=${pnl:+.2f}")
+        out.append("")
+
     # ============ Part 2: Liquidation aftermath ============
     out.append("---")
     out.append("")
@@ -232,11 +311,11 @@ def main():
         out.append("**No price tape available — skipping.**")
         out.append("")
     else:
-        # For each liquidation, compute Δprice at T+5s, T+10s, T+30s, T+60s
+        # For each liquidation, compute Δprice at T+1s, T+2s, T+5s, T+10s, T+20s, T+30s, T+60s
         for liq in liqs:
             T = liq["ts_ms"]
             liq["p_at"] = price_at(price_tape, price_ts, T)
-            for dt_s in [5, 10, 30, 60]:
+            for dt_s in AFTERMATH_HORIZONS:
                 p = price_at(price_tape, price_ts, T + dt_s * 1000)
                 liq[f"dp_{dt_s}s"] = (p - liq["p_at"]) if (p and liq["p_at"]) else None
 
@@ -256,18 +335,19 @@ def main():
         out.append("**Reads:** mean Δprice over the listed horizon AFTER a liquidation event.")
         out.append("Positive Δ = price went UP, negative = DOWN.")
         out.append("")
-        out.append("| Venue | Side (raw) | n | Δ@5s | Δ@10s | Δ@30s | Δ@60s |")
-        out.append("|---|---|---:|---:|---:|---:|---:|")
+        h_hdr = " | ".join(f"Δ@{h}s" for h in AFTERMATH_HORIZONS)
+        out.append(f"| Venue | Side (raw) | n | {h_hdr} |")
+        out.append("|---|---|---:|" + "---:|" * len(AFTERMATH_HORIZONS))
 
         for (venue, side), dps_60 in sorted(side_dp.items()):
             same_set = [l for l in liqs
                         if l["venue"] == venue
                         and (l["side"] or "?").upper() == side
-                        and l.get("dp_5s") is not None]
+                        and l.get("dp_1s") is not None]
             n = len(same_set)
             if n == 0: continue
             row = [venue, side, str(n)]
-            for dt_s in [5, 10, 30, 60]:
+            for dt_s in AFTERMATH_HORIZONS:
                 vals = [l[f"dp_{dt_s}s"] for l in same_set if l.get(f"dp_{dt_s}s") is not None]
                 if vals:
                     mean = statistics.mean(vals)
@@ -282,8 +362,9 @@ def main():
         out.append("")
         out.append("**Reads:** does a LARGER liquidation produce a stronger price reaction?")
         out.append("")
-        out.append("| Size bucket | n | mean Δ@5s | mean Δ@10s | mean Δ@30s | mean Δ@60s | dirΔ@30s ratio |")
-        out.append("|---|---:|---:|---:|---:|---:|---:|")
+        h_hdr2 = " | ".join(f"Δ@{h}s" for h in AFTERMATH_HORIZONS)
+        out.append(f"| Size bucket | n | {h_hdr2} | %DOWN @30s |")
+        out.append("|---|---:|" + "---:|" * len(AFTERMATH_HORIZONS) + "---:|")
 
         size_buckets = [
             ("< $1k", 0, 1_000),
@@ -296,23 +377,22 @@ def main():
             subset = [l for l in liqs
                       if l["usd"] >= lo
                       and (hi is None or l["usd"] < hi)
-                      and l.get("dp_5s") is not None]
+                      and l.get("dp_1s") is not None]
             n = len(subset)
             if n == 0:
-                out.append(f"| {lbl} | 0 | - | - | - | - | - |")
+                empty_cells = " | ".join("-" for _ in AFTERMATH_HORIZONS)
+                out.append(f"| {lbl} | 0 | {empty_cells} | - |")
                 continue
-            means = []
-            for dt_s in [5, 10, 30, 60]:
+            cells = []
+            for dt_s in AFTERMATH_HORIZONS:
                 vals = [l[f"dp_{dt_s}s"] for l in subset if l.get(f"dp_{dt_s}s") is not None]
-                means.append(statistics.mean(vals) if vals else None)
-            # "dirΔ@30s ratio" = % of events where Δ@30s is on the side matching
-            # the side-convention bias for that bucket. We'll just report
-            # % moves DOWN (negative dp_30s) as a proxy.
+                if vals:
+                    cells.append(f"{statistics.mean(vals):+.3f}")
+                else:
+                    cells.append("-")
             dn = sum(1 for l in subset if l.get("dp_30s", 0) < 0)
             dn_pct = 100 * dn / n
-            out.append(f"| {lbl} | {n} | "
-                       f"{means[0]:+.3f} | {means[1]:+.3f} | {means[2]:+.3f} | {means[3]:+.3f} | "
-                       f"{dn_pct:.0f}% DOWN |")
+            out.append(f"| {lbl} | {n} | " + " | ".join(cells) + f" | {dn_pct:.0f}% |")
         out.append("")
 
         # Cluster events: when ≥5 liqs in 60s, what's the price reaction?
@@ -321,26 +401,25 @@ def main():
         out.append("For each bet timestamp, check what price did over the FOLLOWING window.")
         out.append("Different from the per-liquidation view above — this is the perspective the bot sees.")
         out.append("")
-        out.append("| liq_n_60s bucket | n_bets | mean Δprice over next 5s |")
-        out.append("|---|---:|---:|")
+        cluster_hdr = " | ".join(f"Δ@{h}s" for h in AFTERMATH_HORIZONS)
+        out.append(f"| liq_n_60s bucket | n_bets | {cluster_hdr} |")
+        out.append("|---|---:|" + "---:|" * len(AFTERMATH_HORIZONS))
 
-        # Reuse the price tape + a sample of bet timestamps from all bots
         all_bets = []
         for bot_tag, log_rel in LOGS_TO_ANALYZE:
             all_bets.extend(parse_bets(ROOT / log_rel, bot_tag))
-        # de-dup by bet_ts_ms (different bots fire at same time)
         seen = set(); unique_bets = []
         for b in all_bets:
             if b["bet_ts_ms"] in seen: continue
             seen.add(b["bet_ts_ms"]); unique_bets.append(b)
-        # Enrich
         for b in unique_bets:
             T = b["bet_ts_ms"]
             win60 = liq_window(liqs, liq_ts, T, 60)
             b["liq_n_60s"] = len(win60)
             b["p_at_bet"] = price_at(price_tape, price_ts, T)
-            p5 = price_at(price_tape, price_ts, T + 5000)
-            b["dp_5s_forward"] = (p5 - b["p_at_bet"]) if (p5 and b["p_at_bet"]) else None
+            for dt_s in AFTERMATH_HORIZONS:
+                p = price_at(price_tape, price_ts, T + dt_s * 1000)
+                b[f"dp_{dt_s}s_forward"] = (p - b["p_at_bet"]) if (p and b["p_at_bet"]) else None
 
         for bucket in [(0, 0), (1, 2), (3, 4), (5, 9), (10, None)]:
             lo, hi = bucket
@@ -354,18 +433,39 @@ def main():
                 sub = [b for b in unique_bets if lo <= b["liq_n_60s"] <= hi]
                 lbl = f"{lo}-{hi} liqs"
             n = len(sub)
-            dps = [b["dp_5s_forward"] for b in sub if b.get("dp_5s_forward") is not None]
-            if dps:
-                mean = statistics.mean(dps)
-                out.append(f"| {lbl} | {n} | {mean:+.3f} |")
-            else:
-                out.append(f"| {lbl} | {n} | - |")
+            cells = []
+            for dt_s in AFTERMATH_HORIZONS:
+                dps = [b[f"dp_{dt_s}s_forward"] for b in sub if b.get(f"dp_{dt_s}s_forward") is not None]
+                if dps:
+                    cells.append(f"{statistics.mean(dps):+.3f}")
+                else:
+                    cells.append("-")
+            out.append(f"| {lbl} | {n} | " + " | ".join(cells) + " |")
         out.append("")
 
     # ============ Recommendations ============
     out.append("---")
     out.append("")
     out.append("## Interpretation")
+    out.append("")
+    out.append("### Part 1b verdict — long lookback wins; the signal is REGIME, not instant")
+    out.append("")
+    out.append("Reading down the lookback column for each filter type, **the longer the window**, "
+               "**the better the per-tap result.** Both bots peak at 60s lookback:")
+    out.append("")
+    out.append("- **B50 best 4 (by $/tap):** count<5 @ 60s ($0.135), count<3 @ 60s ($0.126), "
+               "count<5 @ 30s ($0.119), usd<$250k @ 60s ($0.113)")
+    out.append("- **B75_rmq80 best 4:** count<5 @ 60s ($0.137), count<3 @ 30s ($0.134), "
+               "count<3 @ 60s ($0.134), usd<$250k @ 60s ($0.120)")
+    out.append("")
+    out.append("Short-window filters (1s/2s/5s) provide little benefit or even mild harm — they "
+               "drop very few bets, and the bets they catch don't differ much from baseline. The "
+               "USD filters at short windows drop 0 bets entirely (no $100k+ liquidations in any "
+               "1-10s window during calm regime).")
+    out.append("")
+    out.append("**Mechanism**: this tells us liquidation density is a *regime indicator*, not "
+               "an *event signal*. A burst of 5 liquidations over 60s means we're in a stressed "
+               "market regime; a single liquidation 2s ago tells us almost nothing.")
     out.append("")
     out.append("### Part 1 verdict — `liq_n_60s < 5` is the winning filter for both bots")
     out.append("")
@@ -404,7 +504,26 @@ def main():
     out.append("(possibly OKX's order book is thinner, so liquidation cascades reverberate further).")
     out.append("")
     out.append("Size stratification confirms the mechanism: bigger liquidations produce bigger moves")
-    out.append("(\\$50k-\\$250k → -\\$0.16 at 30s vs <\\$1k → essentially noise).")
+    out.append("(\\$50k-\\$250k → -\\$0.22 at 20s vs <\\$1k → essentially noise).")
+    out.append("")
+    out.append("### Critical timing finding from the 1s/2s/20s addition")
+    out.append("")
+    out.append("The new short-horizon data reveals the **liquidation-to-price-move timeline**:")
+    out.append("")
+    out.append("For the $50k-$250k bucket (n=12, the meaningful directional zone):")
+    out.append("- Δ@1s:  -$0.056")
+    out.append("- Δ@2s:  -$0.041")
+    out.append("- Δ@5s:  -$0.059")
+    out.append("- Δ@10s: -$0.129")
+    out.append("- **Δ@20s: -$0.221** ← peak negative")
+    out.append("- Δ@30s: -$0.148")
+    out.append("- Δ@60s: -$0.072")
+    out.append("")
+    out.append("**The cascade takes 10-20s to develop**, then partially reverts by 60s. This is "
+               "good news for us: we don't need sub-second reaction. A 5-10s detection-to-fire "
+               "loop captures most of the move. **Our existing 8s cadence is approximately right.** "
+               "But we DO need to detect a liquidation within 2-3 seconds of it firing — we have "
+               "the WS feed already in place.")
     out.append("")
     out.append("### Building a bet-DOWN variant")
     out.append("")
@@ -432,10 +551,11 @@ def main():
     out.append("3. **Time-limited window**: bet must fire within ~2s of the liquidation, before")
     out.append("   MM repricing catches up.")
     out.append("")
-    out.append("**However**: our 8s loop cadence is the bottleneck. By the time we react to a")
-    out.append("liquidation, MM has reset cell mults. We'd need to reduce loop cadence to <500ms")
-    out.append("(or run an event-driven path that listens to liquidations + fires immediately).")
-    out.append("This is doable but is a non-trivial refactor.")
+    out.append("**Updated read on timing**: the multi-window analysis shows the cascade peaks at 20s "
+               "post-liquidation, not at 5s as the original tables suggested. We have a 5-10s window "
+               "to detect+act. An 8s loop is borderline — works if liquidation detection latency is "
+               "<2s. For safety, an event-driven path (separate process listening to WS feed and "
+               "firing taps within ~2s) would be more robust, but isn't strictly required.")
     out.append("")
     out.append("### Caveats")
     out.append("")
