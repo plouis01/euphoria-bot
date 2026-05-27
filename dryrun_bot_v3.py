@@ -604,6 +604,17 @@ def main():
                          "baseline is negative. Single-day data, unvalidated.")
     ap.add_argument("--rmq-filter-window-sec", type=float, default=5.0,
                     help="Lookback window for rmq filter (default 5s).")
+    # ---- Empirical touch-prob calibration ----
+    ap.add_argument("--empirical-calibration", type=str, default="",
+                    help="Path to empirical_calibration.json built by "
+                         "scripts/build_empirical_calibration.py. When set, "
+                         "replaces p_gauss with bucketed historical WR for "
+                         "buckets with n>=min-empirical-n. Per 2026-05-27 "
+                         "analysis, Gaussian over-predicts by 24-40pp; "
+                         "empirical lookup uses observed WR instead.")
+    ap.add_argument("--min-empirical-n", type=int, default=20,
+                    help="Min bucket sample size to use empirical WR (else "
+                         "fall back to Gaussian). Default 20.")
     # ---- Liquidation-density gate (per LIQUIDATION_STRATEGY_ANALYSIS.md) ----
     ap.add_argument("--liq-count-60s-max", type=int, default=-1,
                     help="If >=0, skip bet when >= N+1 liquidations occurred in "
@@ -616,6 +627,20 @@ def main():
                     default="logs/liquidations_*.jsonl",
                     help="Glob pattern for the live liquidation tape. The "
                          "bot tails the most-recent matching file.")
+    # ---- Large-print net-flow gate (per 2026-05-27 analysis on 11k bets) ----
+    ap.add_argument("--flow-down-require-usd", type=float, default=0,
+                    help="If >0, skip DOWN-bets unless net_flow_60s < -this. "
+                         "Per analysis: DOWN x neutral flow lost t=-6.20 "
+                         "(n=3215). Recommended: 500000 (skip DOWN unless "
+                         "net SELL flow > $500k in last 60s). 0 disables.")
+    ap.add_argument("--flow-up-max-usd", type=float, default=0,
+                    help="If >0, skip UP-bets when net_flow_60s > +this. "
+                         "Per analysis: UP x heavy BUY flow was mildly "
+                         "negative t=-0.64 (n=314). Weaker evidence than "
+                         "the DOWN rule. Recommended: 500000. 0 disables.")
+    ap.add_argument("--flow-file-glob", type=str,
+                    default="logs/large_prints_*.jsonl",
+                    help="Glob for the live large-print tape.")
     # ---- Regime gate (skip CHOPPY-FAST kill zone) ----
     ap.add_argument("--regime-gate", action="store_true",
                     help="Skip bets in CHOPPY-FAST regime: σ > 0.20 AND "
@@ -745,6 +770,49 @@ def main():
     calibrator = Calibrator()
     cal2 = Calibrator2(window=args.cal2_window, min_n=args.cal2_min_n,
                        blend=args.cal2_blend) if args.calibrator2 else None
+
+    # ---- Empirical calibration (loads JSON table; bucket-lookup at signal) ----
+    empirical_calib = None
+    if args.empirical_calibration:
+        try:
+            with open(args.empirical_calibration) as fcal:
+                empirical_calib = json.load(fcal)
+            n_buckets = sum(1 for v in empirical_calib["buckets"].values()
+                            if v["n"] >= args.min_empirical_n)
+            print(f"{TAG}[bot] empirical_calibration loaded: "
+                  f"{empirical_calib['n_total']} historical bets, "
+                  f"{n_buckets} buckets with n>={args.min_empirical_n}",
+                  flush=True)
+        except Exception as e:
+            print(f"{TAG}[bot] failed to load empirical_calibration: {e}",
+                  flush=True)
+            empirical_calib = None
+    emp_overrides = 0
+    emp_fallbacks = 0
+
+    def _empirical_p(p_gauss: float, mq: float, sigma: float, drift: float) -> float:
+        """Override p_gauss with empirical bucket WR if calibration loaded
+        and bucket has enough samples. Else return p_gauss unchanged."""
+        nonlocal emp_overrides, emp_fallbacks
+        if empirical_calib is None: return p_gauss
+        mb_idx = 0
+        for i, bound in enumerate(empirical_calib["mult_bins"]):
+            if mq < bound: mb_idx = i; break
+        else:
+            mb_idx = len(empirical_calib["mult_bins"]) - 1
+        sb_idx = 0
+        for i, bound in enumerate(empirical_calib["sigma_bins"]):
+            if sigma < bound: sb_idx = i; break
+        else:
+            sb_idx = len(empirical_calib["sigma_bins"]) - 1
+        ds = 0 if abs(drift) < 0.1 else (1 if drift > 0 else -1)
+        key = f"{mb_idx}_{sb_idx}_{ds}"
+        bucket = empirical_calib["buckets"].get(key)
+        if bucket and bucket["n"] >= args.min_empirical_n:
+            emp_overrides += 1
+            return bucket["wr"]
+        emp_fallbacks += 1
+        return p_gauss
     # LIVE source-of-truth: poll /settlements for on-chain outcomes.
     # /tap responses are unreliable (frequent 504s on successful settlements);
     # the ledger reads the proxy's persistent settlement log and counts each
@@ -825,6 +893,51 @@ def main():
     def _liq_count_last(window_sec: float) -> int:
         cutoff = int(time.time() * 1000) - int(window_sec * 1000)
         return sum(1 for ts in liq_ts_deque if ts >= cutoff)
+
+    # ---- Live large-print net-flow tape (for --flow-down-require-usd) ----
+    flow_buf: deque = deque(maxlen=20000)  # (ts_ms, side, usd)
+    flow_file_path = None
+    flow_file_pos = 0
+    flow_skips = 0
+    flow_active = args.flow_down_require_usd > 0 or args.flow_up_max_usd > 0
+
+    def _refresh_flow_path():
+        nonlocal flow_file_path, flow_file_pos
+        matches = sorted(_glob.glob(args.flow_file_glob))
+        if not matches: return
+        latest = matches[-1]
+        if latest != flow_file_path:
+            flow_file_path = latest
+            flow_file_pos = 0
+            print(f"{TAG}[bot] flow tape -> {latest}", flush=True)
+
+    def _tail_flow():
+        nonlocal flow_file_pos
+        if flow_file_path is None: return
+        try:
+            with open(flow_file_path, "r") as f:
+                f.seek(flow_file_pos)
+                for line in f:
+                    try:
+                        d = json.loads(line)
+                        ts = d.get("ts_ms"); side = (d.get("side") or "").upper()
+                        usd = d.get("usd", 0)
+                        if ts and side and usd:
+                            flow_buf.append((int(ts), side, float(usd)))
+                    except: pass
+                flow_file_pos = f.tell()
+        except FileNotFoundError:
+            pass
+
+    def _net_flow_last(window_sec: float) -> float:
+        """Return net BUY-SELL notional in last window_sec seconds."""
+        cutoff = int(time.time() * 1000) - int(window_sec * 1000)
+        net = 0.0
+        for ts, side, usd in flow_buf:
+            if ts < cutoff: continue
+            if side == "BUY": net += usd
+            elif side == "SELL": net -= usd
+        return net
 
     # Parse --exclude-mult-range "lo-hi"
     excl_lo, excl_hi = None, None
@@ -1356,6 +1469,7 @@ def main():
                     if eff_tau <= 0: continue
                     a = cy * PRICE_INTERVAL; b = a + PRICE_INTERVAL
                     p = _touch(a, b, eff_ts, eff_tau)
+                    p = _empirical_p(p, m, sigma, drift_cb)
                     if p < args.min_p or p > args.max_p: continue
                     p_cal = cal2.adjust(p, sigma, drift_cb) if cal2 is not None else p
                     p_eff = _adjusted_p(p_cal, m)
@@ -1387,6 +1501,7 @@ def main():
                 eff_ts = max(0.0, t_start)
                 eff_tau = TIME_INTERVAL if t_start >= 0 else TIME_INTERVAL + t_start
                 p = _touch(pick["a"], pick["b"], eff_ts, eff_tau)
+                p = _empirical_p(p, pick["mult"], sigma, drift_cb)
                 p_cal = cal2.adjust(p, sigma, drift_cb) if cal2 is not None else p
                 p_eff = _adjusted_p(p_cal, pick["mult"])
                 ev = pick["mult"] * p_eff - 1
@@ -1420,6 +1535,7 @@ def main():
                         eff_tau = TIME_INTERVAL if t_start >= 0 else TIME_INTERVAL + t_start
                         if eff_tau <= 0: continue
                         p = _touch(a, b, eff_ts, eff_tau)
+                        p = _empirical_p(p, m, sigma, drift_cb)
                         p_cal = cal2.adjust(p, sigma, drift_cb) if cal2 is not None else p
                         p_eff = _adjusted_p(p_cal, m)
                         ev = m * p_eff - 1
@@ -1496,6 +1612,31 @@ def main():
                     liq_skips += 1
                     print(f"{TAG}[bot] liq-skip cell=({best['cx']},{best['cy']}) "
                           f"n_liq_60s={n_liq_60s} > max={args.liq_count_60s_max}",
+                          flush=True)
+                    time.sleep(0.5); continue
+
+            # ---- Large-print net-flow gate ----
+            if flow_active:
+                _refresh_flow_path()
+                _tail_flow()
+                net_flow_60s = _net_flow_last(60.0)
+                # Determine bet direction by cell band vs current EU price
+                band_mid = best["cy"] * PRICE_INTERVAL + PRICE_INTERVAL / 2
+                bet_dir = 1 if band_mid > e_price else -1
+                if bet_dir == -1 and args.flow_down_require_usd > 0 \
+                   and net_flow_60s >= -args.flow_down_require_usd:
+                    flow_skips += 1
+                    print(f"{TAG}[bot] flow-skip DOWN-bet cell=({best['cx']},{best['cy']}) "
+                          f"net_flow_60s=${net_flow_60s:+.0f} >= "
+                          f"-${args.flow_down_require_usd:.0f} (need stronger SELL flow)",
+                          flush=True)
+                    time.sleep(0.5); continue
+                if bet_dir == 1 and args.flow_up_max_usd > 0 \
+                   and net_flow_60s > args.flow_up_max_usd:
+                    flow_skips += 1
+                    print(f"{TAG}[bot] flow-skip UP-bet cell=({best['cx']},{best['cy']}) "
+                          f"net_flow_60s=${net_flow_60s:+.0f} > "
+                          f"${args.flow_up_max_usd:.0f} (anti-flow UP bet)",
                           flush=True)
                     time.sleep(0.5); continue
 
