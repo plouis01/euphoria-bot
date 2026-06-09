@@ -662,6 +662,13 @@ def main():
                          "Per LIVE F4k4 analysis 2026-05-24, all 18 bets where "
                          "cell-distance > $1 lost (0%% WR). 1.0 recommended. "
                          "(Note: existing --min-quote-age-ms 1 covers clock-skew.)")
+    # ---- UTC hour-window gate ----
+    ap.add_argument("--hour-window-utc", type=str, default="",
+                    help="Only bet during these UTC hour ranges, e.g. "
+                         "'22-09' (wraps midnight) or '8-11,22-09'. "
+                         "Empty=off. Full-board backtest 2026-06: candidate "
+                         "edge exists only 22-09 UTC (avoid US session). "
+                         "NOTE: hours are UTC, not local.")
     # ---- N5: network-latency ceiling (active monitor) ----
     ap.add_argument("--max-network-latency-ms", type=int, default=99999,
                     help="N5 filter: skip bet if p95 RTT to Euphoria API "
@@ -841,6 +848,20 @@ def main():
     r1_skips = 0  # σ ceiling
     r3_skips = 0  # |drift| ceiling
     r4_skips = 0  # cell-distance ceiling
+    hour_gate_skips = 0  # outside --hour-window-utc
+    # Parse --hour-window-utc "22-09,12-14" → [(22, 9), (12, 14)]
+    hour_windows = []
+    if args.hour_window_utc.strip():
+        for part in args.hour_window_utc.split(","):
+            lo_s, hi_s = part.strip().split("-")
+            lo, hi = int(lo_s), int(hi_s)
+            if not (0 <= lo <= 23 and 0 <= hi <= 24) or lo == hi:
+                print(f"{TAG}[bot] FATAL: bad --hour-window-utc range "
+                      f"'{part}' (need lo!=hi, 0-23)", flush=True)
+                sys.exit(1)
+            hour_windows.append((lo, hi))
+        print(f"{TAG}[bot] hour-window-utc ARMED: {hour_windows} "
+              f"(wrap-around where lo>hi)", flush=True)
     n5_skips = 0  # network-latency ceiling
     excl_skips = 0  # exclude-mult-range
     regime_skips = 0  # CHOPPY-FAST regime gate
@@ -1244,6 +1265,19 @@ def main():
             now = time.time()
             if now - last_tap_ts < args.cadence_sec:
                 time.sleep(0.3); continue
+
+            # ----- UTC hour-window gate -----
+            if hour_windows:
+                h_utc = int(now % 86400 // 3600)
+                in_window = any(
+                    (lo <= h_utc < hi) if lo < hi else (h_utc >= lo or h_utc < hi)
+                    for lo, hi in hour_windows)
+                if not in_window:
+                    hour_gate_skips += 1
+                    if hour_gate_skips % 120 == 1:
+                        print(f"{TAG}[bot] hour-gate: {h_utc:02d}utc outside "
+                              f"{args.hour_window_utc} — idle", flush=True)
+                    time.sleep(5.0); continue
 
             # ----- Feed freshness checks -----
             e_price = st.get("price"); e_priceTs = st.get("priceTs")
@@ -1852,6 +1886,7 @@ def main():
                   f"f1_skips={f1_skips} f4_trips={f4_trips} "
                   f"r1_skips={r1_skips} r3_skips={r3_skips} r4_skips={r4_skips} "
                   f"n5_skips={n5_skips} excl_skips={excl_skips} "
+                  f"hour_gate_skips={hour_gate_skips} "
                   f"rs_mode={rs_mode} rs_transitions={rs_transitions} "
                   f"rs_cold_skips={rs_cold_skips}",
                   flush=True)

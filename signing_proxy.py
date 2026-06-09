@@ -92,6 +92,11 @@ class ProxyState:
         #         "trade_id": str|None, "submitted_payload": dict|None,
         #         "lifecycle": [{"status": str, "ts": float}], ...}
         self.current_tap: Optional[dict] = None
+        # Recently initiated taps keyed by tradeId. Settlement frames arrive
+        # ~35-60s after the tap, by which time current_tap is usually a NEWER
+        # tap (or None) — correlating settled frames against current_tap alone
+        # loses cell attribution. Bounded; insertion-ordered (py3.7+ dict).
+        self.recent_taps: dict = {}
         # Last-seen tradeId per status for diagnostics (manual taps too).
         self.last_executed: Optional[dict] = None
         self.frames: deque = deque(maxlen=FRAME_BUFFER_SIZE)
@@ -163,6 +168,9 @@ def _handle_received(msg: Any) -> None:
                 and msg_sub_id == tap["sub_id"]
                 and tap.get("trade_id") is None and trade_id):
             tap["trade_id"] = trade_id
+            STATE.recent_taps[trade_id] = tap
+            while len(STATE.recent_taps) > 64:
+                STATE.recent_taps.pop(next(iter(STATE.recent_taps)))
 
         if status == "requested" and tap and trade_id == tap.get("trade_id"):
             _record_lifecycle("requested")
@@ -194,10 +202,15 @@ def _handle_received(msg: Any) -> None:
             if new_balance is not None:
                 STATE.balance = new_balance
             # Persist every settled position to disk for audit + later analysis.
-            matched = bool(tap and trade_id == tap.get("trade_id"))
+            # Correlate by tradeId against ALL recently initiated taps — the
+            # tap that settles is rarely still current_tap at 8s bot cadence.
+            rtap = STATE.recent_taps.get(trade_id) if trade_id else None
+            if rtap is None and tap and trade_id == tap.get("trade_id"):
+                rtap = tap
+            matched = rtap is not None
             cell_x = cell_y = None
             if matched:
-                tap_args = (tap or {}).get("tap_args") or {}
+                tap_args = rtap.get("tap_args") or {}
                 cell_x = tap_args.get("cellX")
                 cell_y = tap_args.get("cellY")
             # Attach a dense tick snapshot so scripts/rescore_logs.py can
@@ -227,10 +240,12 @@ def _handle_received(msg: Any) -> None:
                 "coinbaseTicks": cb_ticks,
                 "binanceTicks": bn_ticks,
             })
-            # If this settles the current tap, complete its settled_future.
+            # Complete the settled tap's future + lifecycle (works whether or
+            # not it is still current_tap).
             if matched:
-                _record_lifecycle("settled")
-                sfut = tap.get("settled_future")
+                rtap.setdefault("lifecycle", []).append(
+                    {"status": "settled", "ts": time.time()})
+                sfut = rtap.get("settled_future")
                 if sfut is not None and not sfut.done():
                     sfut.set_result(data)
 

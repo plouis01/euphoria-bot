@@ -87,10 +87,14 @@ def main():
     ap.add_argument("--start-utc", required=True, help='"YYYY-MM-DD HH:MM:SS" UTC')
     ap.add_argument("--end-utc", required=True)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--batch-size", type=int, default=100)
-    ap.add_argument("--sleep", type=float, default=0.25,
-                    help="pause between batches (rate-limit kindness)")
+    ap.add_argument("--batch-size", type=int, default=100,
+                    help="RPC batch limit is 100 (server enforced)")
+    ap.add_argument("--sleep", type=float, default=8.0,
+                    help="initial pause between batches; adapts on 429s (AIMD)")
+    ap.add_argument("--min-sleep", type=float, default=2.0)
+    ap.add_argument("--rpc", type=str, default=RPC)
     args = ap.parse_args()
+    globals()["RPC"] = args.rpc
 
     t_start = calendar.timegm(time.strptime(args.start_utc, "%Y-%m-%d %H:%M:%S"))
     t_end = calendar.timegm(time.strptime(args.end_utc, "%Y-%m-%d %H:%M:%S"))
@@ -133,6 +137,7 @@ def main():
     t0 = time.time()
     written = 0
     fails = 0
+    sleep_s = args.sleep  # AIMD: grow on 429, shrink slowly on success
     with open(out_path, "a") as f:
         blk = max(b_start, done_until + 1)
         while blk <= b_end:
@@ -140,13 +145,14 @@ def main():
             try:
                 res = fetch_batch(batch)
                 fails = 0
+                sleep_s = max(args.min_sleep, sleep_s * 0.93)
             except Exception as e:
                 fails += 1
-                wait = min(2 ** fails, 60)
-                print(f"[tape] batch @{blk:,} failed ({e}); retry in {wait}s",
+                sleep_s = min(sleep_s * 1.6, 45.0)
+                print(f"[tape] batch @{blk:,} failed ({e}); sleep→{sleep_s:.1f}s",
                       flush=True)
-                time.sleep(wait)
-                if fails > 12:
+                time.sleep(sleep_s)
+                if fails > 20:
                     print("[tape] too many consecutive failures — exiting "
                           "(rerun to resume)", flush=True)
                     sys.exit(1)
@@ -166,12 +172,14 @@ def main():
             f.flush()
             blk = batch[-1] + 1
             done_frac = (blk - b_start) / total
-            if (blk - b_start) % (args.batch_size * 50) < args.batch_size:
+            if (blk - b_start) % (args.batch_size * 20) < args.batch_size:
                 elapsed = time.time() - t0
-                eta = elapsed / max(done_frac, 1e-9) * (1 - done_frac)
+                rate = (blk - max(b_start, done_until + 1)) / max(elapsed, 1e-9)
+                remaining = (b_end - blk) / max(rate, 1e-9)
                 print(f"[tape] {done_frac:6.1%}  block {blk:,}/{b_end:,}  "
-                      f"prints+{written:,}  eta {eta/60:.0f}m", flush=True)
-            time.sleep(args.sleep)
+                      f"prints+{written:,}  {rate:.0f} blk/s  sleep={sleep_s:.1f}s  "
+                      f"eta {remaining/60:.0f}m", flush=True)
+            time.sleep(sleep_s)
     print(f"[tape] DONE — wrote {written:,} new prints to {out_path}", flush=True)
 
 
